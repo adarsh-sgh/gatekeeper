@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package gatekeeper.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/adarsh-sgh/gatekeeper/api/gatekeeper/v1;gatekeeperv1";
+
+// Gatekeeper is a multi-tenant policy decision point. The tenant is taken
+// from the caller's JWT, never from the request body.
+service Gatekeeper {
+  // Check evaluates (subject, action, resource) against the tenant's active
+  // policy and appends the decision to the tenant's audit chain.
+  rpc Check(CheckRequest) returns (CheckResponse);
+  // PutPolicy stores a new Rego policy version. Idempotent on idempotency_key.
+  rpc PutPolicy(PutPolicyRequest) returns (PutPolicyResponse);
+  // PromotePolicy makes a shadow version the active one.
+  rpc PromotePolicy(PromotePolicyRequest) returns (PromotePolicyResponse);
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
+  // VerifyAuditChain re-hashes the tenant's audit log and reports the first break.
+  rpc VerifyAuditChain(VerifyAuditChainRequest) returns (VerifyAuditChainResponse);
+}
+
+message Subject {
+  string id = 1;
+  repeated string roles = 2;
+  google.protobuf.Struct attrs = 3;
+}
+
+message Resource {
+  string type = 1;
+  string id = 2;
+  google.protobuf.Struct attrs = 3;
+}
+
+message CheckRequest {
+  Subject subject = 1;
+  string action = 2;
+  Resource resource = 3;
+}
+
+message CheckResponse {
+  bool allowed = 1;
+  string reason = 2;
+  int64 policy_version = 3;
+  int64 audit_seq = 4;
+}
+
+message PutPolicyRequest {
+  string rego = 1;
+  string idempotency_key = 2;
+  // shadow=true installs the version alongside the active one: it is evaluated
+  // on every Check and divergence is logged, but the old decision is served.
+  bool shadow = 3;
+}
+
+message PutPolicyResponse {
+  int64 version = 1;
+  // created=false means the idempotency key matched an earlier request.
+  bool created = 2;
+  bool shadow = 3;
+}
+
+message PromotePolicyRequest {
+  int64 version = 1;
+}
+
+message PromotePolicyResponse {
+  int64 active_version = 1;
+}
+
+message AuditEvent {
+  int64 seq = 1;
+  google.protobuf.Timestamp ts = 2;
+  string tenant = 3;
+  string caller = 4;
+  Subject subject = 5;
+  string action = 6;
+  Resource resource = 7;
+  int64 policy_version = 8;
+  bool allowed = 9;
+  string reason = 10;
+  int64 shadow_version = 11;
+  bool shadow_allowed = 12;
+  bool shadow_diverged = 13;
+  string prev_hash = 14;
+  string hash = 15;
+}
+
+message ListAuditEventsRequest {
+  int64 after_seq = 1;
+  int32 limit = 2;
+}
+
+message ListAuditEventsResponse {
+  repeated AuditEvent events = 1;
+}
+
+message VerifyAuditChainRequest {}
+
+message VerifyAuditChainResponse {
+  bool ok = 1;
+  int64 events_checked = 2;
+  // Set when ok=false: the first seq whose hash does not match.
+  int64 broken_at_seq = 3;
+}
