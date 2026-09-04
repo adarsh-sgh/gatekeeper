@@ -3,11 +3,11 @@
 set -eu
 out=${1:-certs}
 mkdir -p "$out" && cd "$out"
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
-  -subj "/CN=gatekeeper-dev-ca" -keyout ca.key -out ca.crt 2>/dev/null
+# ecparam -genkey emits a named-curve key on both OpenSSL and LibreSSL; `req -newkey ec` may not.
+for name in ca server client; do openssl ecparam -name prime256v1 -genkey -noout -out $name.key; done
+openssl req -x509 -new -key ca.key -days 365 -subj "/CN=gatekeeper-dev-ca" -out ca.crt 2>/dev/null
 for name in server client; do
-  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-    -subj "/CN=$name" -keyout $name.key -out $name.csr 2>/dev/null
+  openssl req -new -key $name.key -subj "/CN=$name" -out $name.csr 2>/dev/null
   printf "subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=${name}Auth\n" > $name.ext
   openssl x509 -req -in $name.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 \
     -extfile $name.ext -out $name.crt 2>/dev/null
