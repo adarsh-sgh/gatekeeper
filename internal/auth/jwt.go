@@ -36,7 +36,9 @@ func (c *Claims) HasScope(s string) bool { return slices.Contains(strings.Fields
 
 type ctxKey struct{}
 
-func WithClaims(ctx context.Context, c *Claims) context.Context { return context.WithValue(ctx, ctxKey{}, c) }
+func WithClaims(ctx context.Context, c *Claims) context.Context {
+	return context.WithValue(ctx, ctxKey{}, c)
+}
 
 func FromContext(ctx context.Context) (*Claims, bool) {
 	c, ok := ctx.Value(ctxKey{}).(*Claims)

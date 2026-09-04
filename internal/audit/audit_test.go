@@ -11,7 +11,7 @@ func chain(n int) []Event {
 	for i := 1; i <= n; i++ {
 		e := Event{Seq: int64(i), TS: time.Now(), Tenant: "acme", Caller: "svc",
 			Subject: Subject{ID: "u1", Roles: []string{"dev"}, Attrs: map[string]any{"z": 1, "a": "x"}},
-			Action: "read", Resource: Resource{Type: "doc", ID: "d1"}, Allowed: i%2 == 0, Reason: "r"}
+			Action:  "read", Resource: Resource{Type: "doc", ID: "d1"}, Allowed: i%2 == 0, Reason: "r"}
 		e.PrevHash = prev
 		e.Hash = Hash(prev, e)
 		prev = e.Hash
@@ -52,7 +52,7 @@ func TestHashIsCanonical(t *testing.T) {
 	a := Event{Seq: 1, TS: ts, Subject: Subject{ID: "u", Attrs: map[string]any{"z": 1, "a": "x"}}}
 	b := a
 	b.TS = ts.Add(400 * time.Nanosecond).In(time.FixedZone("x", 3600)) // below Postgres precision, other zone
-	b.Subject.Attrs = map[string]any{"a": "x", "z": 1}                    // other insertion order
+	b.Subject.Attrs = map[string]any{"a": "x", "z": 1}                 // other insertion order
 	if Hash(Genesis, a) != Hash(Genesis, b) {
 		t.Fatal("hash not stable under ts precision/zone and map order")
 	}

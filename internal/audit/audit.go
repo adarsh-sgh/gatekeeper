@@ -65,15 +65,33 @@ func Hash(prevHash string, e Event) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Verify walks events (ascending seq, starting at the chain head) and returns
-// the seq of the first event whose links do not hold, or 0 if all are intact.
+// Checker verifies a chain incrementally so callers can page through storage.
+type Checker struct {
+	prevHash string
+	prevSeq  int64
+	n        int64
+}
+
+func NewChecker() *Checker { return &Checker{prevHash: Genesis} }
+
+// Next returns false if e does not link correctly to the previous event.
+func (c *Checker) Next(e Event) bool {
+	if e.PrevHash != c.prevHash || e.Hash != Hash(c.prevHash, e) || (c.n > 0 && e.Seq != c.prevSeq+1) {
+		return false
+	}
+	c.prevHash, c.prevSeq, c.n = e.Hash, e.Seq, c.n+1
+	return true
+}
+
+func (c *Checker) Checked() int64 { return c.n }
+
+// Verify returns the seq of the first event whose links do not hold, or 0.
 func Verify(events []Event) (brokenAt int64) {
-	prev := Genesis
-	for i, e := range events {
-		if e.PrevHash != prev || e.Hash != Hash(prev, e) || (i > 0 && e.Seq != events[i-1].Seq+1) {
+	c := NewChecker()
+	for _, e := range events {
+		if !c.Next(e) {
 			return e.Seq
 		}
-		prev = e.Hash
 	}
 	return 0
 }
