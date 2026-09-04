@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gatekeeper
+      POSTGRES_PASSWORD: gatekeeper
+      POSTGRES_DB: gatekeeper
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatekeeper"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  gatekeeper:
+    build: ..
+    profiles: ["app"]  # `docker compose --profile app up` runs the service too
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PG_DSN: postgres://gatekeeper:gatekeeper@postgres:5432/gatekeeper?sslmode=disable
+    command: ["-dev-issuer", "-pg-dsn", "$$PG_DSN", "-http", ":8080", "-grpc", ":9090"]
+    ports: ["8080:8080", "9090:9090"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: ["app"]
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9091:9090"]

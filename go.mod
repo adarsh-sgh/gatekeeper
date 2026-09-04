@@ -3,6 +3,7 @@ module github.com/adarsh-sgh/gatekeeper
 go 1.26.2
 
 require (
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/open-policy-agent/opa v1.20.2
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
@@ -15,6 +16,9 @@ require (
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/lestrrat-go/blackmagic v1.0.4 // indirect
 	github.com/lestrrat-go/dsig v1.3.0 // indirect
 	github.com/lestrrat-go/dsig-secp256k1 v1.0.0 // indirect
