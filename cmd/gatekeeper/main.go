@@ -68,7 +68,14 @@ func run(grpcAddr, httpAddr, pgDSN, issuer, audience, jwksURL string, devIssuer 
 		if err != nil {
 			return err
 		}
-		issuer, jwksURL = iss.Name, "http://127.0.0.1"+httpAddr+"/dev/jwks.json"
+		host, port, err := net.SplitHostPort(httpAddr)
+		if err != nil {
+			return fmt.Errorf("-http %q: %w", httpAddr, err)
+		}
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		issuer, jwksURL = iss.Name, "http://"+net.JoinHostPort(host, port)+"/dev/jwks.json"
 		extra["GET /dev/jwks.json"] = http.HandlerFunc(iss.JWKS)
 		tok := iss.Mint("dev-admin", "acme", []string{"admin"},
 			auth.ScopeCheck+" "+auth.ScopePolicyWrite+" "+auth.ScopeAuditRead, 12*time.Hour)

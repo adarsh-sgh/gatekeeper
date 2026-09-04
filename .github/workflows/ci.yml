@@ -1,0 +1,20 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: gatekeeper, POSTGRES_PASSWORD: gatekeeper, POSTGRES_DB: gatekeeper }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U gatekeeper" --health-interval 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go test -race -tags integration ./internal/store/...
+        env: { PG_DSN: "postgres://gatekeeper:gatekeeper@localhost:5432/gatekeeper?sslmode=disable" }
+      - run: docker build -t gatekeeper .
