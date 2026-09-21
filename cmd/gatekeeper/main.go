@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -32,7 +33,7 @@ type config struct {
 	grpcAddr, httpAddr         string
 	pgDSN                      string
 	issuer, audience, jwksURL  string
-	devIssuer                  bool
+	devIssuer, pprof           bool
 	tlsCert, tlsKey, clientCA  string
 	rate                       float64
 	burst                      int
@@ -53,6 +54,7 @@ func main() {
 	flag.StringVar(&c.tlsCert, "tls-cert", "", "gRPC server certificate (PEM); enables TLS")
 	flag.StringVar(&c.tlsKey, "tls-key", "", "gRPC server key (PEM)")
 	flag.StringVar(&c.clientCA, "tls-client-ca", "", "CA bundle for client certs; enables mTLS on gRPC")
+	flag.BoolVar(&c.pprof, "pprof", false, "serve net/http/pprof under /debug/pprof/ on the HTTP port")
 	flag.Float64Var(&c.rate, "rate", 0, "per-tenant requests/second; 0 disables rate limiting")
 	flag.IntVar(&c.burst, "burst", 100, "per-tenant burst allowance when -rate is set")
 	flag.DurationVar(&c.drainDelay, "drain", 5*time.Second, "on SIGTERM: time to fail readiness before closing listeners")
@@ -97,6 +99,13 @@ func run(c config, log *slog.Logger) error {
 		tok := iss.Mint("dev-admin", "acme", []string{"admin"},
 			auth.ScopeCheck+" "+auth.ScopePolicyWrite+" "+auth.ScopeAuditRead, 12*time.Hour)
 		fmt.Printf("export TOKEN=%s\n", tok)
+	}
+	if c.pprof {
+		extra["GET /debug/pprof/"] = http.HandlerFunc(pprof.Index)
+		extra["GET /debug/pprof/profile"] = http.HandlerFunc(pprof.Profile)
+		extra["GET /debug/pprof/{name}"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			pprof.Handler(r.PathValue("name")).ServeHTTP(w, r)
+		})
 	}
 	if c.issuer == "" || c.jwksURL == "" {
 		return fmt.Errorf("-issuer and -jwks-url are required (or use -dev-issuer)")
