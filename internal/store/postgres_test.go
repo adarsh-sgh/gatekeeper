@@ -4,8 +4,10 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +28,41 @@ func pg(t *testing.T) *Postgres {
 }
 
 func TestPostgresStore(t *testing.T) { runSuite(t, pg(t)) }
+
+// Two instances (separate pools, separate head caches) append to one tenant
+// at once: the PK race is lost and retried, and the chain still verifies.
+func TestPostgresAppendAcrossInstances(t *testing.T) {
+	a, b := pg(t), pg(t)
+	ctx := context.Background()
+	tenant := "multi-" + time.Now().Format("150405.000000")
+	const perInstance = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*perInstance)
+	for _, s := range []*Postgres{a, b} {
+		for i := range perInstance {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs <- s.AppendAudit(ctx, &audit.Event{TS: time.Now(), Tenant: tenant, Caller: "svc", Action: "read",
+					Subject: audit.Subject{ID: fmt.Sprint("u", i)}, Resource: audit.Resource{Type: "doc"}, PolicyVersion: 1})
+			}()
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	evs, err := a.ListAudit(ctx, tenant, 0, 1000)
+	if err != nil || len(evs) != 2*perInstance {
+		t.Fatalf("got %d events err=%v", len(evs), err)
+	}
+	if broken := audit.Verify(evs); broken != 0 {
+		t.Fatalf("chain broken at %d", broken)
+	}
+}
 
 // The DB rejects edits outright; if someone bypasses the trigger, Verify catches it.
 func TestPostgresAuditIsTamperEvident(t *testing.T) {
