@@ -49,4 +49,25 @@ func TestVerifierAgainstIssuer(t *testing.T) {
 	if _, err := v.Verify(ctx, other.Mint("a", "acme", nil, "", time.Minute)); err == nil {
 		t.Error("token signed by unknown key accepted")
 	}
+
+	// Cached verdicts: a seen token passes without its key, an unseen one does not;
+	// a zero TTL disables the cache.
+	tok := iss.Mint("bob", "acme", nil, "", time.Minute)
+	if _, err := v.Verify(ctx, tok); err != nil {
+		t.Fatal(err)
+	}
+	v.mu.Lock()
+	clear(v.keys)
+	v.lastFetch = time.Now() // suppress JWKS refetch
+	v.mu.Unlock()
+	if c, err := v.Verify(ctx, tok); err != nil || c.Subject != "bob" {
+		t.Errorf("cached token: %+v %v", c, err)
+	}
+	if _, err := v.Verify(ctx, iss.Mint("carol", "acme", nil, "", time.Minute)); err == nil {
+		t.Error("unseen token verified without a key")
+	}
+	v.CacheTTL = 0
+	if _, err := v.Verify(ctx, tok); err == nil {
+		t.Error("cache served with TTL 0")
+	}
 }
