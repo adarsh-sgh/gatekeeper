@@ -1,0 +1,41 @@
+# Minimal Deployment showing how the probes and drain fit together.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: gatekeeper }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: gatekeeper } }
+  template:
+    metadata: { labels: { app: gatekeeper } }
+    spec:
+      terminationGracePeriodSeconds: 30   # > -drain + -shutdown-timeout
+      containers:
+        - name: gatekeeper
+          image: gatekeeper:latest
+          args: ["-issuer", "$(ISSUER)", "-jwks-url", "$(JWKS_URL)", "-rate", "2000", "-burst", "500", "-drain", "5s"]
+          env:
+            - { name: PG_DSN, valueFrom: { secretKeyRef: { name: gatekeeper-pg, key: dsn } } }
+            - { name: ISSUER, value: "https://idp.example" }
+            - { name: JWKS_URL, value: "https://idp.example/.well-known/jwks.json" }
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: grpc, containerPort: 9090 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 2
+            failureThreshold: 1           # drain flips this on the first probe after SIGTERM
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "500m", memory: "128Mi" }
+            limits: { memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: gatekeeper }
+spec:
+  selector: { app: gatekeeper }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+    - { name: grpc, port: 9090, targetPort: grpc }

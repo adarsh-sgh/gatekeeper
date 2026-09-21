@@ -1,4 +1,4 @@
-.PHONY: run test test-integration proto up down certs lint build
+.PHONY: run test test-integration proto up down certs lint build load
 
 build:
 	go build -o bin/gatekeeper ./cmd/gatekeeper
@@ -30,3 +30,6 @@ certs: ## self-signed CA + server + client certs for mTLS in ./certs
 
 lint:
 	go vet ./...
+
+load: ## needs a running server and TOKEN (from `make run`)
+	go run ./cmd/gkload -grpc localhost:9090 -token "$(TOKEN)" -c 64 -d 10s

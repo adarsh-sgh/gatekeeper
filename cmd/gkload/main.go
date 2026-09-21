@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,7 +57,7 @@ func (r *result) add(d time.Duration, err error) {
 func main() {
 	httpURL := flag.String("http", "", "HTTP base URL, e.g. http://localhost:8080")
 	grpcAddr := flag.String("grpc", "", "gRPC address, e.g. localhost:9090 (plaintext)")
-	token := flag.String("token", os.Getenv("TOKEN"), "bearer token with policy:check")
+	token := flag.String("token", os.Getenv("TOKEN"), "bearer token(s) with policy:check, comma-separated; clients round-robin over them")
 	conc := flag.Int("c", 32, "concurrent clients")
 	total := flag.Int("n", 0, "total requests; 0 = run for -d")
 	dur := flag.Duration("d", 10*time.Second, "duration when -n is 0")
@@ -65,13 +66,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "need exactly one of -http/-grpc, and -token")
 		os.Exit(2)
 	}
+	tokens := strings.Split(*token, ",")
 
-	var call func(context.Context) error
+	var call func(context.Context, string) error
 	if *httpURL != "" {
 		client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: *conc, MaxConnsPerHost: *conc}}
-		call = func(ctx context.Context) error {
+		call = func(ctx context.Context, tok string) error {
 			req, _ := http.NewRequestWithContext(ctx, "POST", *httpURL+"/v1/check", bytes.NewReader([]byte(body)))
-			req.Header.Set("Authorization", "Bearer "+*token)
+			req.Header.Set("Authorization", "Bearer "+tok)
 			resp, err := client.Do(req)
 			if err != nil {
 				return err
@@ -95,8 +97,8 @@ func main() {
 		defer conn.Close()
 		gc := pb.NewGatekeeperClient(conn)
 		req := &pb.CheckRequest{Subject: &pb.Subject{Id: "u1"}, Action: "write", Resource: &pb.Resource{Type: "doc", Id: "d1"}}
-		call = func(ctx context.Context) error {
-			_, err := gc.Check(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+*token), req)
+		call = func(ctx context.Context, tok string) error {
+			_, err := gc.Check(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+tok), req)
 			return err
 		}
 	}
@@ -116,12 +118,13 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			tok := tokens[i%len(tokens)]
 			for !stop.Load() {
 				if *total > 0 && issued.Add(1) > int64(*total) {
 					return
 				}
 				t0 := time.Now()
-				err := call(ctx)
+				err := call(ctx, tok)
 				res.add(time.Since(t0), err)
 			}
 		}()
@@ -137,8 +140,8 @@ func main() {
 		return res.lat[min(len(res.lat)-1, int(float64(len(res.lat))*p))]
 	}
 	n := int64(len(res.lat))
-	fmt.Printf("clients=%d requests=%d ok=%d ratelimited=%d failed=%d elapsed=%s\n",
-		*conc, n, res.ok.Load(), res.limited.Load(), res.failed.Load(), elapsed.Round(time.Millisecond))
+	fmt.Printf("clients=%d tenants=%d requests=%d ok=%d ratelimited=%d failed=%d elapsed=%s\n",
+		*conc, len(tokens), n, res.ok.Load(), res.limited.Load(), res.failed.Load(), elapsed.Round(time.Millisecond))
 	fmt.Printf("throughput=%.0f req/s  p50=%s p90=%s p99=%s max=%s\n",
 		float64(n)/elapsed.Seconds(), pct(0.5).Round(time.Microsecond), pct(0.9).Round(time.Microsecond),
 		pct(0.99).Round(time.Microsecond), pct(1).Round(time.Microsecond))

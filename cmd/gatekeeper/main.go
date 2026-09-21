@@ -96,6 +96,9 @@ func run(c config, log *slog.Logger) error {
 		}
 		c.issuer, c.jwksURL = iss.Name, "http://"+net.JoinHostPort(host, port)+"/dev/jwks.json"
 		extra["GET /dev/jwks.json"] = http.HandlerFunc(iss.JWKS)
+		extra["GET /dev/token"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { // load tests, one token per tenant
+			w.Write([]byte(iss.Mint("dev-admin", r.URL.Query().Get("tenant"), nil, auth.ScopeCheck+" "+auth.ScopePolicyWrite, time.Hour)))
+		})
 		tok := iss.Mint("dev-admin", "acme", []string{"admin"},
 			auth.ScopeCheck+" "+auth.ScopePolicyWrite+" "+auth.ScopeAuditRead, 12*time.Hour)
 		fmt.Printf("export TOKEN=%s\n", tok)
