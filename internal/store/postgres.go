@@ -31,6 +31,8 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 	return &Postgres{pool: pool}, nil
 }
 
+func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
+
 func (p *Postgres) Close() error { p.pool.Close(); return nil }
 
 // tx runs fn under a transaction holding a per-tenant advisory lock, which

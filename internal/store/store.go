@@ -41,6 +41,8 @@ type Store interface {
 	AppendAudit(ctx context.Context, ev *audit.Event) error
 	// ListAudit returns up to limit events with seq > afterSeq, ascending.
 	ListAudit(ctx context.Context, tenant string, afterSeq int64, limit int) ([]audit.Event, error)
+	// Ping reports whether the backing store is reachable; readiness depends on it.
+	Ping(ctx context.Context) error
 	Close() error
 }
 

@@ -22,4 +22,14 @@ var (
 	Errors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "gatekeeper_errors_total", Help: "Internal errors by operation.",
 	}, []string{"op"})
+	RateLimited = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gatekeeper_ratelimited_total", Help: "Requests rejected by the per-tenant limiter.",
+	}, []string{"tenant"})
+	RequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "gatekeeper_request_seconds", Help: "End-to-end request latency by method and status code.",
+		Buckets: prometheus.ExponentialBuckets(1e-4, 4, 8),
+	}, []string{"method", "code"})
+	InFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "gatekeeper_inflight_requests", Help: "Requests currently being served.",
+	})
 )

@@ -24,19 +24,22 @@ import (
 
 	pb "github.com/adarsh-sgh/gatekeeper/api/gatekeeper/v1"
 	"github.com/adarsh-sgh/gatekeeper/internal/auth"
+	"github.com/adarsh-sgh/gatekeeper/internal/ratelimit"
 	"github.com/adarsh-sgh/gatekeeper/internal/store"
 )
 
 const allScopes = auth.ScopeCheck + " " + auth.ScopePolicyWrite + " " + auth.ScopeAuditRead
 
 type env struct {
-	iss  *auth.Issuer
-	grpc pb.GatekeeperClient
-	http *httptest.Server
+	iss    *auth.Issuer
+	grpc   pb.GatekeeperClient
+	http   *httptest.Server
+	health *Health
 }
 
 // newEnv wires issuer -> verifier -> service -> in-process gRPC and HTTP listeners.
-func newEnv(t *testing.T) *env {
+// The optional limiter is shared by both transports, as in main.
+func newEnv(t *testing.T, limiter ...*ratelimit.Limiter) *env {
 	t.Helper()
 	iss, err := auth.NewIssuer("https://issuer.test", "gatekeeper")
 	if err != nil {
@@ -45,11 +48,17 @@ func newEnv(t *testing.T) *env {
 	jwks := httptest.NewServer(http.HandlerFunc(iss.JWKS))
 	t.Cleanup(jwks.Close)
 	v := auth.NewVerifier(iss.Name, "gatekeeper", jwks.URL)
-	svc := New(store.NewMemory(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	st := store.NewMemory()
+	svc := New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o := Options{Verifier: v, Health: NewHealth(st), Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if len(limiter) > 0 {
+		o.Limiter = limiter[0]
+	}
 
 	lis := bufconn.Listen(1 << 20)
-	gs := grpc.NewServer(grpc.UnaryInterceptor(UnaryAuth(v)))
+	gs := grpc.NewServer(GRPCInterceptors(o))
 	pb.RegisterGatekeeperServer(gs, svc)
+	o.Health.Register(gs)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
 	conn, err := grpc.NewClient("passthrough:///bufconn", grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -58,9 +67,9 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	hs := httptest.NewServer(NewHTTPHandler(svc, v, nil))
+	hs := httptest.NewServer(NewHTTPHandler(svc, o))
 	t.Cleanup(hs.Close)
-	return &env{iss: iss, grpc: pb.NewGatekeeperClient(conn), http: hs}
+	return &env{iss: iss, grpc: pb.NewGatekeeperClient(conn), http: hs, health: o.Health}
 }
 
 func (e *env) ctx(sub, tenant, scope string) context.Context {
@@ -260,5 +269,68 @@ func TestHTTPMirror(t *testing.T) {
 		if !strings.Contains(string(b), m) {
 			t.Errorf("metric %s not exposed", m)
 		}
+	}
+}
+
+// Per-tenant limiter over both transports: one tenant's burst exhausts only
+// its own bucket; the caller gets 429 / ResourceExhausted with a Retry-After.
+func TestRateLimitPerTenant(t *testing.T) {
+	e := newEnv(t, ratelimit.New(1, 2)) // 1/s, burst 2
+	check := &pb.CheckRequest{Subject: &pb.Subject{Id: "u"}, Action: "read", Resource: &pb.Resource{Type: "doc"}}
+	acme := e.ctx("svc", "acme", auth.ScopeCheck)
+	for i := 0; i < 2; i++ {
+		if _, err := e.grpc.Check(acme, check); err != nil {
+			t.Fatalf("burst %d: %v", i, err)
+		}
+	}
+	var hdr metadata.MD
+	if _, err := e.grpc.Check(acme, check, grpc.Header(&hdr)); code(err) != codes.ResourceExhausted || len(hdr.Get("retry-after")) == 0 {
+		t.Fatalf("3rd grpc call: err=%v hdr=%v", err, hdr)
+	}
+	if _, err := e.grpc.Check(e.ctx("svc", "globex", auth.ScopeCheck), check); err != nil {
+		t.Fatalf("other tenant limited: %v", err)
+	}
+
+	req, _ := http.NewRequest("POST", e.http.URL+"/v1/check", strings.NewReader(`{"subject":{"id":"u"},"action":"read","resource":{"type":"doc"}}`))
+	req.Header.Set("Authorization", "Bearer "+e.iss.Mint("svc", "acme", nil, auth.ScopeCheck, time.Minute))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 429 || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("http over limit: %v %v", resp.StatusCode, err)
+	}
+	resp, _ = http.Get(e.http.URL + "/metrics")
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), `gatekeeper_ratelimited_total{tenant="acme"} 2`) {
+		t.Errorf("ratelimited metric not counted: %s", b)
+	}
+}
+
+// Request ids are honoured when given and generated otherwise, on both transports;
+// readiness follows the drain flag.
+func TestRequestIDsAndReadiness(t *testing.T) {
+	e := newEnv(t)
+	check := &pb.CheckRequest{Subject: &pb.Subject{Id: "u"}, Action: "read", Resource: &pb.Resource{Type: "doc"}}
+	var hdr metadata.MD
+	ctx := metadata.AppendToOutgoingContext(e.ctx("svc", "acme", auth.ScopeCheck), RequestIDHeader, "req-42")
+	if _, err := e.grpc.Check(ctx, check, grpc.Header(&hdr)); err != nil || hdr.Get(RequestIDHeader)[0] != "req-42" {
+		t.Fatalf("grpc echo: %v %v", hdr, err)
+	}
+	hdr = nil
+	if _, err := e.grpc.Check(e.ctx("svc", "acme", auth.ScopeCheck), check, grpc.Header(&hdr)); err != nil || len(hdr.Get(RequestIDHeader)[0]) != 16 {
+		t.Fatalf("grpc generated id: %v %v", hdr, err)
+	}
+	resp, _ := http.Get(e.http.URL + "/v1/audit") // 401, still gets an id
+	if resp.StatusCode != 401 || len(resp.Header.Get(RequestIDHeader)) != 16 {
+		t.Fatalf("http generated id: %d %q", resp.StatusCode, resp.Header.Get(RequestIDHeader))
+	}
+
+	if resp, _ = http.Get(e.http.URL + "/readyz"); resp.StatusCode != 200 {
+		t.Fatalf("readyz: %d", resp.StatusCode)
+	}
+	e.health.Drain()
+	if resp, _ = http.Get(e.http.URL + "/readyz"); resp.StatusCode != 503 {
+		t.Fatalf("readyz while draining: %d", resp.StatusCode)
+	}
+	if _, err := e.grpc.Check(e.ctx("svc", "acme", auth.ScopeCheck), check); err != nil {
+		t.Fatalf("draining must not reject requests: %v", err)
 	}
 }

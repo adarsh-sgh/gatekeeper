@@ -87,4 +87,6 @@ func (m *Memory) ListAudit(_ context.Context, tenant string, afterSeq int64, lim
 	return append([]audit.Event(nil), evs[start:end]...), nil
 }
 
+func (m *Memory) Ping(context.Context) error { return nil }
+
 func (m *Memory) Close() error { return nil }

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -18,12 +20,16 @@ import (
 	pb "github.com/adarsh-sgh/gatekeeper/api/gatekeeper/v1"
 	"github.com/adarsh-sgh/gatekeeper/internal/auth"
 	"github.com/adarsh-sgh/gatekeeper/internal/metrics"
+	"github.com/adarsh-sgh/gatekeeper/internal/ratelimit"
 )
 
 // UnaryAuth is the gRPC interceptor: it turns the bearer token in the
 // `authorization` metadata into Claims on the context.
 func UnaryAuth(v *auth.Verifier) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+	return func(ctx context.Context, req any, srv *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+		if strings.HasPrefix(srv.FullMethod, "/grpc.health.v1.Health/") {
+			return h(ctx, req) // probes carry no token
+		}
 		md, _ := metadata.FromIncomingContext(ctx)
 		var hdr string
 		if vals := md.Get("authorization"); len(vals) > 0 {
@@ -33,6 +39,7 @@ func UnaryAuth(v *auth.Verifier) grpc.UnaryServerInterceptor {
 		if err != nil {
 			return nil, err
 		}
+		setTenant(ctx, claims.Tenant)
 		return h(auth.WithClaims(ctx, claims), req)
 	}
 }
@@ -52,14 +59,21 @@ func verify(ctx context.Context, v *auth.Verifier, header string) (*auth.Claims,
 }
 
 // NewHTTPHandler mirrors the gRPC API as JSON over HTTP using the same
-// request/response messages (protojson), plus /metrics and /healthz.
-// extra lets main mount dev-only routes such as the embedded issuer's JWKS.
-func NewHTTPHandler(svc *Service, v *auth.Verifier, extra map[string]http.Handler) http.Handler {
+// request/response messages (protojson), plus /metrics, /healthz and /readyz.
+// Every API route gets a request id, an access-log line and the tenant limiter.
+func NewHTTPHandler(svc *Service, o Options) http.Handler {
+	v := o.Verifier
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
-	for pattern, h := range extra {
+	if o.Health != nil {
+		mux.HandleFunc("GET /readyz", o.Health.readyz)
+	}
+	for pattern, h := range o.Extra {
 		mux.Handle(pattern, h)
+	}
+	authed := func(v *auth.Verifier, next http.Handler) http.Handler {
+		return httpAccess(o.Log, authedLimited(v, o.Limiter, next))
 	}
 	mux.Handle("POST /v1/check", authed(v, handle(svc.Check, body(func() *pb.CheckRequest { return &pb.CheckRequest{} }))))
 	mux.Handle("PUT /v1/policies", authed(v, handle(svc.PutPolicy, func(r *http.Request) (*pb.PutPolicyRequest, error) {
@@ -84,14 +98,24 @@ func NewHTTPHandler(svc *Service, v *auth.Verifier, extra map[string]http.Handle
 	return mux
 }
 
-func authed(v *auth.Verifier, next http.Handler) http.Handler {
+func authedLimited(v *auth.Verifier, l *ratelimit.Limiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		claims, err := verify(r.Context(), v, r.Header.Get("Authorization"))
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(auth.WithClaims(r.Context(), claims)))
+		ctx := auth.WithClaims(r.Context(), claims)
+		setTenant(ctx, claims.Tenant)
+		if l != nil {
+			if ok, wait := l.Allow(claims.Tenant); !ok {
+				metrics.RateLimited.WithLabelValues(claims.Tenant).Inc()
+				w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+				writeError(w, status.Errorf(codes.ResourceExhausted, "tenant %s rate limited, retry in %s", claims.Tenant, wait.Round(time.Millisecond)))
+				return
+			}
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -126,7 +150,8 @@ func handle[Req, Resp proto.Message](rpc func(context.Context, Req) (Resp, error
 
 var httpCodes = map[codes.Code]int{
 	codes.InvalidArgument: 400, codes.Unauthenticated: 401, codes.PermissionDenied: 403,
-	codes.NotFound: 404, codes.FailedPrecondition: 409,
+	codes.NotFound: 404, codes.FailedPrecondition: 409, codes.ResourceExhausted: 429,
+	codes.Unavailable: 503,
 }
 
 func writeError(w http.ResponseWriter, err error) {

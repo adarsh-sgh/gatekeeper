@@ -22,39 +22,56 @@ import (
 
 	pb "github.com/adarsh-sgh/gatekeeper/api/gatekeeper/v1"
 	"github.com/adarsh-sgh/gatekeeper/internal/auth"
+	"github.com/adarsh-sgh/gatekeeper/internal/ratelimit"
 	"github.com/adarsh-sgh/gatekeeper/internal/server"
 	"github.com/adarsh-sgh/gatekeeper/internal/store"
 	"github.com/adarsh-sgh/gatekeeper/internal/tlsutil"
 )
 
+type config struct {
+	grpcAddr, httpAddr         string
+	pgDSN                      string
+	issuer, audience, jwksURL  string
+	devIssuer                  bool
+	tlsCert, tlsKey, clientCA  string
+	rate                       float64
+	burst                      int
+	drainDelay, shutdownWindow time.Duration
+	// started, if set, receives the bound addresses once both listeners are up (tests).
+	started chan<- [2]string
+}
+
 func main() {
-	var (
-		grpcAddr  = flag.String("grpc", ":9090", "gRPC listen address")
-		httpAddr  = flag.String("http", ":8080", "HTTP listen address (JSON API, /metrics, /healthz)")
-		pgDSN     = flag.String("pg-dsn", os.Getenv("PG_DSN"), "Postgres DSN; empty = in-memory store")
-		issuer    = flag.String("issuer", "", "expected JWT iss")
-		audience  = flag.String("audience", "gatekeeper", "expected JWT aud")
-		jwksURL   = flag.String("jwks-url", "", "JWKS endpoint of the issuer")
-		devIssuer = flag.Bool("dev-issuer", false, "embed a token issuer and print an admin token for tenant 'acme'")
-		tlsCert   = flag.String("tls-cert", "", "gRPC server certificate (PEM); enables TLS")
-		tlsKey    = flag.String("tls-key", "", "gRPC server key (PEM)")
-		clientCA  = flag.String("tls-client-ca", "", "CA bundle for client certs; enables mTLS on gRPC")
-	)
+	var c config
+	flag.StringVar(&c.grpcAddr, "grpc", ":9090", "gRPC listen address")
+	flag.StringVar(&c.httpAddr, "http", ":8080", "HTTP listen address (JSON API, /metrics, /healthz, /readyz)")
+	flag.StringVar(&c.pgDSN, "pg-dsn", os.Getenv("PG_DSN"), "Postgres DSN; empty = in-memory store")
+	flag.StringVar(&c.issuer, "issuer", "", "expected JWT iss")
+	flag.StringVar(&c.audience, "audience", "gatekeeper", "expected JWT aud")
+	flag.StringVar(&c.jwksURL, "jwks-url", "", "JWKS endpoint of the issuer")
+	flag.BoolVar(&c.devIssuer, "dev-issuer", false, "embed a token issuer and print an admin token for tenant 'acme'")
+	flag.StringVar(&c.tlsCert, "tls-cert", "", "gRPC server certificate (PEM); enables TLS")
+	flag.StringVar(&c.tlsKey, "tls-key", "", "gRPC server key (PEM)")
+	flag.StringVar(&c.clientCA, "tls-client-ca", "", "CA bundle for client certs; enables mTLS on gRPC")
+	flag.Float64Var(&c.rate, "rate", 0, "per-tenant requests/second; 0 disables rate limiting")
+	flag.IntVar(&c.burst, "burst", 100, "per-tenant burst allowance when -rate is set")
+	flag.DurationVar(&c.drainDelay, "drain", 5*time.Second, "on SIGTERM: time to fail readiness before closing listeners")
+	flag.DurationVar(&c.shutdownWindow, "shutdown-timeout", 10*time.Second, "after drain: time for in-flight requests to finish")
 	flag.Parse()
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(*grpcAddr, *httpAddr, *pgDSN, *issuer, *audience, *jwksURL, *devIssuer, *tlsCert, *tlsKey, *clientCA, log); err != nil {
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	if err := run(c, log); err != nil {
 		log.Error("exit", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(grpcAddr, httpAddr, pgDSN, issuer, audience, jwksURL string, devIssuer bool, tlsCert, tlsKey, clientCA string, log *slog.Logger) error {
+func run(c config, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var st store.Store = store.NewMemory()
-	if pgDSN != "" {
-		pg, err := store.NewPostgres(ctx, pgDSN)
+	if c.pgDSN != "" {
+		pg, err := store.NewPostgres(ctx, c.pgDSN)
 		if err != nil {
 			return fmt.Errorf("postgres: %w", err)
 		}
@@ -63,58 +80,86 @@ func run(grpcAddr, httpAddr, pgDSN, issuer, audience, jwksURL string, devIssuer 
 	defer st.Close()
 
 	extra := map[string]http.Handler{}
-	if devIssuer {
-		iss, err := auth.NewIssuer("gatekeeper-dev", audience)
+	if c.devIssuer {
+		iss, err := auth.NewIssuer("gatekeeper-dev", c.audience)
 		if err != nil {
 			return err
 		}
-		host, port, err := net.SplitHostPort(httpAddr)
+		host, port, err := net.SplitHostPort(c.httpAddr)
 		if err != nil {
-			return fmt.Errorf("-http %q: %w", httpAddr, err)
+			return fmt.Errorf("-http %q: %w", c.httpAddr, err)
 		}
 		if host == "" {
 			host = "127.0.0.1"
 		}
-		issuer, jwksURL = iss.Name, "http://"+net.JoinHostPort(host, port)+"/dev/jwks.json"
+		c.issuer, c.jwksURL = iss.Name, "http://"+net.JoinHostPort(host, port)+"/dev/jwks.json"
 		extra["GET /dev/jwks.json"] = http.HandlerFunc(iss.JWKS)
 		tok := iss.Mint("dev-admin", "acme", []string{"admin"},
 			auth.ScopeCheck+" "+auth.ScopePolicyWrite+" "+auth.ScopeAuditRead, 12*time.Hour)
 		fmt.Printf("export TOKEN=%s\n", tok)
 	}
-	if issuer == "" || jwksURL == "" {
+	if c.issuer == "" || c.jwksURL == "" {
 		return fmt.Errorf("-issuer and -jwks-url are required (or use -dev-issuer)")
 	}
-	verifier := auth.NewVerifier(issuer, audience, jwksURL)
+	health := server.NewHealth(st)
+	opts := server.Options{Verifier: auth.NewVerifier(c.issuer, c.audience, c.jwksURL), Health: health, Log: log, Extra: extra}
+	if c.rate > 0 {
+		opts.Limiter = ratelimit.New(c.rate, c.burst)
+		go opts.Limiter.SweepEvery(time.Minute, 10*time.Minute, ctx.Done())
+	}
 	svc := server.New(st, log)
 
-	opts := []grpc.ServerOption{grpc.UnaryInterceptor(server.UnaryAuth(verifier))}
-	if tlsCert != "" {
-		cfg, err := tlsutil.ServerConfig(tlsCert, tlsKey, clientCA)
+	gopts := []grpc.ServerOption{server.GRPCInterceptors(opts)}
+	if c.tlsCert != "" {
+		cfg, err := tlsutil.ServerConfig(c.tlsCert, c.tlsKey, c.clientCA)
 		if err != nil {
 			return err
 		}
-		opts = append(opts, grpc.Creds(credentials.NewTLS(cfg)))
+		gopts = append(gopts, grpc.Creds(credentials.NewTLS(cfg)))
 	}
-	gs := grpc.NewServer(opts...)
+	gs := grpc.NewServer(gopts...)
 	pb.RegisterGatekeeperServer(gs, svc)
-	lis, err := net.Listen("tcp", grpcAddr)
+	health.Register(gs)
+	glis, err := net.Listen("tcp", c.grpcAddr)
 	if err != nil {
 		return err
 	}
-	hs := &http.Server{Addr: httpAddr, Handler: server.NewHTTPHandler(svc, verifier, extra), ReadHeaderTimeout: 5 * time.Second}
+	hlis, err := net.Listen("tcp", c.httpAddr)
+	if err != nil {
+		return err
+	}
+	hs := &http.Server{Handler: server.NewHTTPHandler(svc, opts), ReadHeaderTimeout: 5 * time.Second}
 
 	errc := make(chan error, 2)
-	go func() { errc <- gs.Serve(lis) }()
-	go func() { errc <- hs.ListenAndServe() }()
-	log.Info("listening", "grpc", grpcAddr, "http", httpAddr, "mtls", clientCA != "", "store", map[bool]string{true: "postgres", false: "memory"}[pgDSN != ""])
+	go func() { errc <- gs.Serve(glis) }()
+	go func() { errc <- hs.Serve(hlis) }()
+	log.Info("listening", "grpc", glis.Addr().String(), "http", hlis.Addr().String(), "mtls", c.clientCA != "",
+		"store", map[bool]string{true: "postgres", false: "memory"}[c.pgDSN != ""], "rate", c.rate)
+	if c.started != nil {
+		c.started <- [2]string{glis.Addr().String(), hlis.Addr().String()}
+	}
 
 	select {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Drain: fail readiness first so upstreams stop routing to us, keep
+	// serving meanwhile, then close listeners and let in-flight work finish.
+	log.Info("draining", "delay", c.drainDelay, "shutdown_timeout", c.shutdownWindow)
+	health.Drain()
+	time.Sleep(c.drainDelay)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), c.shutdownWindow)
 	defer cancel()
-	gs.GracefulStop()
-	return hs.Shutdown(shutdownCtx)
+	stopped := make(chan struct{})
+	go func() { gs.GracefulStop(); close(stopped) }()
+	err = hs.Shutdown(shutdownCtx)
+	select {
+	case <-stopped:
+	case <-shutdownCtx.Done():
+		gs.Stop()
+		log.Warn("shutdown timeout: killed in-flight gRPC requests")
+	}
+	log.Info("stopped")
+	return err
 }
