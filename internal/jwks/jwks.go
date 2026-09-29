@@ -37,7 +37,7 @@ type Key struct {
 
 type Set struct {
 	url        string
-	client     *http.Client
+	Client     *http.Client
 	MinRefetch time.Duration
 	MaxAge     time.Duration
 	Now        func() time.Time
@@ -52,7 +52,7 @@ type Set struct {
 }
 
 func New(url string) *Set {
-	return &Set{url: url, client: &http.Client{Timeout: 5 * time.Second},
+	return &Set{url: url, Client: &http.Client{Timeout: 5 * time.Second},
 		MinRefetch: 10 * time.Second, MaxAge: 10 * time.Minute, Now: time.Now, keys: map[string]Key{}}
 }
 
@@ -116,7 +116,7 @@ func (s *Set) fetch(ctx context.Context) (map[string]Key, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.client.Do(req)
+	resp, err := s.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch jwks: %w", err)
 	}
