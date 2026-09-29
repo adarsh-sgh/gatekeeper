@@ -4,20 +4,16 @@ package auth
 
 import (
 	"context"
-	"crypto/rsa"
 	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"math/big"
-	"net/http"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/adarsh-sgh/gatekeeper/internal/jwks"
 )
 
 const (
@@ -31,6 +27,12 @@ type Claims struct {
 	Tenant string   `json:"tenant"`
 	Roles  []string `json:"roles,omitempty"`
 	Scope  string   `json:"scope,omitempty"` // space-separated, per RFC 8693
+	SID    string   `json:"sid,omitempty"`   // session/refresh family; revoking it kills every token in it
+
+	// Identity carried by front-door session tokens; empty for service tokens.
+	Email  string   `json:"email,omitempty"`
+	Groups []string `json:"groups,omitempty"`
+	Source string   `json:"src,omitempty"`
 }
 
 func (c *Claims) HasScope(s string) bool { return slices.Contains(strings.Fields(c.Scope), s) }
@@ -46,21 +48,19 @@ func FromContext(ctx context.Context) (*Claims, bool) {
 	return c, ok
 }
 
-// Verifier checks signature, issuer, audience, expiry and the presence of a
-// tenant claim. Keys are fetched lazily from jwksURL and refreshed at most
-// once a minute when an unknown kid shows up (key rotation).
+// Verifier checks signature, issuer, audience, expiry, the presence of a
+// tenant claim and, if Revoked is set, the token's jti and sid. Keys come
+// from a jwks.Set (kid cache, throttled refetch, stale-on-error).
 //
 // Verified tokens are remembered for CacheTTL (bounded by their exp): RS256
 // verification is the single most expensive step per request, and service
-// callers reuse one token for thousands of calls.
+// callers reuse one token for thousands of calls. Revocation is checked on
+// every call, cached or not.
 type Verifier struct {
-	issuer, audience, jwksURL string
-	client                    *http.Client
-	CacheTTL                  time.Duration
-
-	mu        sync.Mutex
-	keys      map[string]*rsa.PublicKey
-	lastFetch time.Time
+	issuer, audience string
+	keys             *jwks.Set
+	CacheTTL         time.Duration
+	Revoked          *RevocationList
 
 	cmu   sync.RWMutex
 	cache map[[32]byte]cached
@@ -76,11 +76,23 @@ type cached struct {
 const cacheMax = 10000
 
 func NewVerifier(issuer, audience, jwksURL string) *Verifier {
-	return &Verifier{issuer: issuer, audience: audience, jwksURL: jwksURL, CacheTTL: time.Minute,
-		client: &http.Client{Timeout: 5 * time.Second}, keys: map[string]*rsa.PublicKey{}, cache: map[[32]byte]cached{}}
+	return &Verifier{issuer: issuer, audience: audience, keys: jwks.New(jwksURL), CacheTTL: time.Minute, cache: map[[32]byte]cached{}}
 }
 
+var ErrRevoked = errors.New("token revoked")
+
 func (v *Verifier) Verify(ctx context.Context, token string) (*Claims, error) {
+	c, err := v.verifyCached(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	if v.Revoked != nil && v.Revoked.Revoked(c.ID, c.SID) {
+		return nil, ErrRevoked
+	}
+	return c, nil
+}
+
+func (v *Verifier) verifyCached(ctx context.Context, token string) (*Claims, error) {
 	if v.CacheTTL <= 0 {
 		return v.verify(ctx, token)
 	}
@@ -111,7 +123,7 @@ func (v *Verifier) Verify(ctx context.Context, token string) (*Claims, error) {
 
 func (v *Verifier) verify(ctx context.Context, token string) (*Claims, error) {
 	claims := &Claims{}
-	_, err := jwt.ParseWithClaims(token, claims, v.keyFor,
+	_, err := jwt.ParseWithClaims(token, claims, v.keys.Keyfunc(ctx),
 		jwt.WithValidMethods([]string{"RS256"}), jwt.WithIssuer(v.issuer), jwt.WithAudience(v.audience),
 		jwt.WithExpirationRequired(), jwt.WithLeeway(30*time.Second))
 	if err != nil {
@@ -121,54 +133,6 @@ func (v *Verifier) verify(ctx context.Context, token string) (*Claims, error) {
 		return nil, errors.New("token missing tenant or sub claim")
 	}
 	return claims, nil
-}
-
-func (v *Verifier) keyFor(t *jwt.Token) (any, error) {
-	kid, _ := t.Header["kid"].(string)
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if k, ok := v.keys[kid]; ok {
-		return k, nil
-	}
-	if time.Since(v.lastFetch) < time.Minute {
-		return nil, fmt.Errorf("unknown kid %q", kid)
-	}
-	if err := v.refreshLocked(); err != nil {
-		return nil, err
-	}
-	if k, ok := v.keys[kid]; ok {
-		return k, nil
-	}
-	return nil, fmt.Errorf("unknown kid %q", kid)
-}
-
-type jwk struct {
-	Kty, Kid, N, E string
-}
-
-func (v *Verifier) refreshLocked() error {
-	v.lastFetch = time.Now()
-	resp, err := v.client.Get(v.jwksURL)
-	if err != nil {
-		return fmt.Errorf("fetch jwks: %w", err)
-	}
-	defer resp.Body.Close()
-	var doc struct{ Keys []jwk }
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		return fmt.Errorf("decode jwks: %w", err)
-	}
-	for _, k := range doc.Keys {
-		if k.Kty != "RSA" {
-			continue
-		}
-		n, err1 := base64.RawURLEncoding.DecodeString(k.N)
-		e, err2 := base64.RawURLEncoding.DecodeString(k.E)
-		if err := errors.Join(err1, err2); err != nil {
-			return fmt.Errorf("jwk %q: %w", k.Kid, err)
-		}
-		v.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(new(big.Int).SetBytes(e).Int64())}
-	}
-	return nil
 }
 
 // Bearer extracts the token from an Authorization header value.

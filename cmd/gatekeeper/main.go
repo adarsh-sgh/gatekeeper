@@ -34,6 +34,7 @@ type config struct {
 	pgDSN                      string
 	issuer, audience, jwksURL  string
 	devIssuer, pprof           bool
+	devRotate                  time.Duration
 	tlsCert, tlsKey, clientCA  string
 	rate                       float64
 	burst                      int
@@ -51,6 +52,7 @@ func main() {
 	flag.StringVar(&c.audience, "audience", "gatekeeper", "expected JWT aud")
 	flag.StringVar(&c.jwksURL, "jwks-url", "", "JWKS endpoint of the issuer")
 	flag.BoolVar(&c.devIssuer, "dev-issuer", false, "embed a token issuer and print an admin token for tenant 'acme'")
+	flag.DurationVar(&c.devRotate, "dev-key-rotate", 0, "with -dev-issuer: rotate the signing key this often; the next key is published one period ahead")
 	flag.StringVar(&c.tlsCert, "tls-cert", "", "gRPC server certificate (PEM); enables TLS")
 	flag.StringVar(&c.tlsKey, "tls-key", "", "gRPC server key (PEM)")
 	flag.StringVar(&c.clientCA, "tls-client-ca", "", "CA bundle for client certs; enables mTLS on gRPC")
@@ -102,6 +104,12 @@ func run(c config, log *slog.Logger) error {
 		tok := iss.Mint("dev-admin", "acme", []string{"admin"},
 			auth.ScopeCheck+" "+auth.ScopePolicyWrite+" "+auth.ScopeAuditRead, 12*time.Hour)
 		fmt.Printf("export TOKEN=%s\n", tok)
+		if c.devRotate > 0 {
+			if err := iss.PrepareNext(); err != nil {
+				return err
+			}
+			go rotateEvery(ctx, iss, c.devRotate, log)
+		}
 	}
 	if c.pprof {
 		extra["GET /debug/pprof/"] = http.HandlerFunc(pprof.Index)
@@ -174,4 +182,23 @@ func run(c config, log *slog.Logger) error {
 	}
 	log.Info("stopped")
 	return err
+}
+
+// rotateEvery switches to the pre-published key and publishes the next one.
+// Old keys stay in the JWKS for 12h, the longest dev token TTL.
+func rotateEvery(ctx context.Context, iss *auth.Issuer, every time.Duration, log *slog.Logger) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		err := iss.Rotate(12 * time.Hour)
+		if err == nil {
+			err = iss.PrepareNext()
+		}
+		log.Info("dev issuer key rotated", "kid", iss.Kid(), "err", err)
+	}
 }
