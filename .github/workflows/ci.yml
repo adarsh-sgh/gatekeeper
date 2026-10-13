@@ -1,20 +1,42 @@
 name: ci
 on: [push, pull_request]
 jobs:
-  test:
+  unit:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env: { POSTGRES_USER: gatekeeper, POSTGRES_PASSWORD: gatekeeper, POSTGRES_DB: gatekeeper }
-        ports: ["5432:5432"]
-        options: --health-cmd "pg_isready -U gatekeeper" --health-interval 2s --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
+      - uses: bufbuild/buf-action@v1
+        with: { setup_only: true }
+      - name: generated code matches the proto
+        run: buf generate && git diff --exit-code api/
       - run: go vet ./...
       - run: go test -race ./...
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_wrapper: false }
+      - name: terraform provider acceptance tests
+        run: TF_ACC=1 go test -count=1 -v ./internal/tfprovider/...
+
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      PG_DSN: postgres://gatekeeper:gatekeeper@localhost:5432/gatekeeper?sslmode=disable
+      KAFKA_BROKERS: localhost:19092
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: docker compose -f deploy/docker-compose.yml --profile stream up -d --wait postgres redpanda
       - run: go test -race -tags integration ./internal/store/...
-        env: { PG_DSN: "postgres://gatekeeper:gatekeeper@localhost:5432/gatekeeper?sslmode=disable" }
-      - run: docker build -t gatekeeper .
+      - name: outbox exactly-once under SIGKILL
+        run: go test -count=1 -v -tags e2e -run TestOutboxExactlyOnceUnderKills ./e2e/
+
+  envoy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: Envoy ext_authz e2e (builds the Docker image)
+        run: make e2e-envoy

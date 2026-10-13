@@ -49,4 +49,6 @@ func Start(t testing.TB) *Server {
 }
 
 // Token mints a token for tenant with the given space-separated scopes.
-func (s *Server) Token(sub, tenant, scope string) string { return s.Iss.Mint(sub, tenant, nil, scope, time.Hour) }
+func (s *Server) Token(sub, tenant, scope string) string {
+	return s.Iss.Mint(sub, tenant, nil, scope, time.Hour)
+}
