@@ -224,7 +224,7 @@ against the audit log itself.
 
 | run                                   | events | relay SIGKILLs | consumer SIGKILLs | duplicate records on topic | redelivered records skipped | projection vs audit log |
 |---------------------------------------|-------:|---------------:|------------------:|---------------------------:|----------------------------:|------------------------|
-| GitHub Actions `ubuntu-latest`, CI    | 20,000 | 13             | 11                | 79                         | ≥ 2,260                     | equal (0 off)          |
+| GitHub Actions `ubuntu-latest`, [CI run](https://github.com/adarsh-sgh/gatekeeper/actions/runs/38483619618) | 20,000 | 13             | 11                | 79                         | ≥ 2,260                     | equal (0 off)          |
 | Apple M5 laptop, Postgres/Redpanda in Docker | 20,000 | 22      | 19                | 500                        | ≥ 1,171                     | equal (0 off)          |
 
 Both runs also had the one injected crash per process. "Duplicate records" is topic
