@@ -1,0 +1,8 @@
+# gkctl sync -f examples/gkctl/gatekeeper.yaml
+tenants:
+  - name: acme
+    display_name: Acme Corp
+    policy: policies/acme.rego
+  - name: edge
+    display_name: Envoy-fronted apps
+    policy: policies/edge.rego
