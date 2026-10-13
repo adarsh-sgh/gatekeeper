@@ -37,7 +37,7 @@ type config struct {
 	pgDSN                      string
 	issuer, audience, jwksURL  string
 	devIssuer, pprof, outbox   bool
-	devRotate                  time.Duration
+	devRotate, tokenCache      time.Duration
 	tlsCert, tlsKey, clientCA  string
 	rate                       float64
 	burst                      int
@@ -60,6 +60,7 @@ func main() {
 	flag.StringVar(&c.tlsCert, "tls-cert", "", "gRPC server certificate (PEM); enables TLS")
 	flag.StringVar(&c.tlsKey, "tls-key", "", "gRPC server key (PEM)")
 	flag.StringVar(&c.clientCA, "tls-client-ca", "", "CA bundle for client certs; enables mTLS on gRPC")
+	flag.DurationVar(&c.tokenCache, "token-cache", time.Minute, "cache verified tokens this long (capped at expiry); 0 verifies RS256 on every request")
 	flag.BoolVar(&c.pprof, "pprof", false, "serve net/http/pprof under /debug/pprof/ on the HTTP port")
 	flag.Float64Var(&c.rate, "rate", 0, "per-tenant requests/second; 0 disables rate limiting")
 	flag.IntVar(&c.burst, "burst", 100, "per-tenant burst allowance when -rate is set")
@@ -137,7 +138,9 @@ func run(c config, log *slog.Logger) error {
 		return fmt.Errorf("-issuer and -jwks-url are required (or use -dev-issuer)")
 	}
 	health := server.NewHealth(st)
-	opts := server.Options{Verifier: auth.NewVerifier(c.issuer, c.audience, c.jwksURL), Health: health, Log: log, Extra: extra}
+	v := auth.NewVerifier(c.issuer, c.audience, c.jwksURL)
+	v.CacheTTL = c.tokenCache
+	opts := server.Options{Verifier: v, Health: health, Log: log, Extra: extra}
 	if c.rate > 0 {
 		opts.Limiter = ratelimit.New(c.rate, c.burst)
 		go opts.Limiter.SweepEvery(time.Minute, 10*time.Minute, ctx.Done())
