@@ -131,7 +131,7 @@ func (s *Service) PutPolicy(ctx context.Context, req *pb.PutPolicyRequest) (*pb.
 		if req.Shadow {
 			st.Shadow = p.Version
 		} else {
-			st.Active, st.Shadow = p.Version, 0
+			st.Active = p.Version // slots are independent: a shadow keeps running
 		}
 		if err := s.store.SetTenantState(ctx, tenant, st); err != nil {
 			return nil, internal("set tenant state", err)

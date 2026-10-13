@@ -33,12 +33,18 @@ resource "gatekeeper_policy" "acme" {
   tenant = gatekeeper_tenant.acme.name
   rego   = %q
 }
+
+resource "gatekeeper_policy" "acme_next" {
+  tenant = gatekeeper_tenant.acme.name
+  rego   = "package gatekeeper\nallow := input.action == \"read\""
+  shadow = true
+}
 `, displayName, rego)
 }
 
 // Acceptance test (TF_ACC=1, real terraform binary) against an in-process
-// gatekeeper: create, update to a new immutable version, import both
-// resources, detect an out-of-band policy change as drift and repair it, and
+// gatekeeper: create a tenant with active and shadow policies, update to a
+// new immutable version, import all three resources, detect an out-of-band policy change as drift and repair it, and
 // destroy, after which the tenant is gone and its checks deny.
 func TestAccTenantAndPolicy(t *testing.T) {
 	srv := testserver.Start(t)
@@ -62,6 +68,18 @@ func TestAccTenantAndPolicy(t *testing.T) {
 		}
 	}
 
+	// The shadow slot survives an update of the active one.
+	shadowVersionKept := func(s *terraform.State) error {
+		tn, err := admin.GetTenant(context.Background(), &pb.GetTenantRequest{Name: "acme"})
+		if err != nil {
+			return err
+		}
+		if got := s.RootModule().Resources["gatekeeper_policy.acme_next"].Primary.Attributes["version"]; got != fmt.Sprint(tn.ShadowVersion) || tn.ShadowVersion == 0 {
+			return fmt.Errorf("shadow slot v%d, state says %s", tn.ShadowVersion, got)
+		}
+		return nil
+	}
+
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: map[string]func() (tfprotov6.ProviderServer, error){
 			"gatekeeper": providerserver.NewProtocol6WithError(New("test")()),
@@ -78,18 +96,20 @@ func TestAccTenantAndPolicy(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("gatekeeper_tenant.acme", "id", "acme"),
 					resource.TestCheckResourceAttr("gatekeeper_policy.acme", "id", "acme/active"),
-					resource.TestCheckResourceAttr("gatekeeper_policy.acme", "version", "1"),
+					resource.TestCheckResourceAttr("gatekeeper_policy.acme_next", "id", "acme/shadow"),
 					decision(true)),
 			},
 			{
 				Config: config("Acme Corp", denyAll),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr("gatekeeper_tenant.acme", "display_name", "Acme Corp"),
-					resource.TestCheckResourceAttr("gatekeeper_policy.acme", "version", "2"),
+					resource.TestCheckResourceAttr("gatekeeper_policy.acme", "version", "3"), // v1, v2 = active, shadow
+					shadowVersionKept,
 					decision(false)),
 			},
 			{ResourceName: "gatekeeper_tenant.acme", ImportState: true, ImportStateVerify: true},
 			{ResourceName: "gatekeeper_policy.acme", ImportState: true, ImportStateId: "acme/active", ImportStateVerify: true},
+			{ResourceName: "gatekeeper_policy.acme_next", ImportState: true, ImportStateId: "acme/shadow", ImportStateVerify: true},
 			{
 				PreConfig: func() {
 					if _, err := admin.PutPolicy(context.Background(), &pb.PutPolicyRequest{Tenant: "acme", Rego: allowAll}); err != nil {
@@ -98,12 +118,12 @@ func TestAccTenantAndPolicy(t *testing.T) {
 				},
 				Config:             config("Acme Corp", denyAll),
 				PlanOnly:           true,
-				ExpectNonEmptyPlan: true, // drift: v3 was put behind Terraform's back
+				ExpectNonEmptyPlan: true, // drift: v4 was put behind Terraform's back
 			},
 			{
 				Config: config("Acme Corp", denyAll),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("gatekeeper_policy.acme", "version", "4"),
+					resource.TestCheckResourceAttr("gatekeeper_policy.acme", "version", "5"),
 					decision(false)),
 			},
 			{

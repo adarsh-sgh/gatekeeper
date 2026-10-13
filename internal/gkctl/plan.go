@@ -65,7 +65,6 @@ func planSlots(name string, d, c tenant) []change {
 		default:
 			out = append(out, change{sign: sign(c.active), what: fmt.Sprintf("policy %s/active from %s", name, d.active.source),
 				diff: udiff(name+"/active", c.active, d.active), apply: put(name, d.active.rego, false)})
-			c.shadow = slot{} // a non-shadow put clears the shadow slot
 		}
 	}
 	if !d.shadow.same(c.shadow) {
