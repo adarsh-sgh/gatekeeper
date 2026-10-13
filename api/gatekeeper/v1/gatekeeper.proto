@@ -2,24 +2,66 @@ syntax = "proto3";
 
 package gatekeeper.v1;
 
+import "google/api/annotations.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/adarsh-sgh/gatekeeper/api/gatekeeper/v1;gatekeeperv1";
 
 // Gatekeeper is a multi-tenant policy decision point. The tenant is taken
-// from the caller's JWT, never from the request body.
+// from the caller's JWT, never from the request body; the only exception is
+// the optional `tenant` field on admin RPCs, which needs scope tenants:admin.
+//
+// This file is the single source of truth: buf generates the gRPC server and
+// client (the Go SDK), the grpc-gateway HTTP/JSON routes below and an
+// OpenAPI document from it.
 service Gatekeeper {
   // Check evaluates (subject, action, resource) against the tenant's active
   // policy and appends the decision to the tenant's audit chain.
-  rpc Check(CheckRequest) returns (CheckResponse);
-  // PutPolicy stores a new Rego policy version. Idempotent on idempotency_key.
-  rpc PutPolicy(PutPolicyRequest) returns (PutPolicyResponse);
-  // PromotePolicy makes a shadow version the active one.
-  rpc PromotePolicy(PromotePolicyRequest) returns (PromotePolicyResponse);
-  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
+  rpc Check(CheckRequest) returns (CheckResponse) {
+    option (google.api.http) = {post: "/v1/check" body: "*"};
+  }
+  // PutPolicy stores a new Rego policy version. Idempotent on idempotency_key
+  // (also read from the Idempotency-Key header / metadata).
+  rpc PutPolicy(PutPolicyRequest) returns (PutPolicyResponse) {
+    option (google.api.http) = {put: "/v1/policies" body: "*"};
+  }
+  rpc GetPolicy(GetPolicyRequest) returns (Policy) {
+    option (google.api.http) = {get: "/v1/policies/{version}"};
+  }
+  // PromotePolicy makes a stored version the active one.
+  rpc PromotePolicy(PromotePolicyRequest) returns (PromotePolicyResponse) {
+    option (google.api.http) = {post: "/v1/policies/{version}/promote"};
+  }
+  // UnsetPolicy clears the active (or shadow) slot. With no active policy
+  // every Check denies: removing a policy fails closed.
+  rpc UnsetPolicy(UnsetPolicyRequest) returns (UnsetPolicyResponse) {
+    option (google.api.http) = {post: "/v1/policies:unset" body: "*"};
+  }
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse) {
+    option (google.api.http) = {get: "/v1/audit"};
+  }
   // VerifyAuditChain re-hashes the tenant's audit log and reports the first break.
-  rpc VerifyAuditChain(VerifyAuditChainRequest) returns (VerifyAuditChainResponse);
+  rpc VerifyAuditChain(VerifyAuditChainRequest) returns (VerifyAuditChainResponse) {
+    option (google.api.http) = {get: "/v1/audit/verify"};
+  }
+
+  // Tenant registry (scope tenants:admin). Tokens for unregistered tenants
+  // still work; registering adds metadata and the `disabled` kill switch.
+  rpc PutTenant(PutTenantRequest) returns (Tenant) {
+    option (google.api.http) = {put: "/v1/tenants/{tenant.name}" body: "tenant"};
+  }
+  rpc GetTenant(GetTenantRequest) returns (Tenant) {
+    option (google.api.http) = {get: "/v1/tenants/{name}"};
+  }
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse) {
+    option (google.api.http) = {get: "/v1/tenants"};
+  }
+  // DeleteTenant unregisters the tenant and clears its rollout state. Policy
+  // versions and the audit chain are immutable history and are kept.
+  rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse) {
+    option (google.api.http) = {delete: "/v1/tenants/{name}"};
+  }
 }
 
 message Subject {
@@ -53,6 +95,8 @@ message PutPolicyRequest {
   // shadow=true installs the version alongside the active one: it is evaluated
   // on every Check and divergence is logged, but the old decision is served.
   bool shadow = 3;
+  // Empty means the caller's tenant.
+  string tenant = 4;
 }
 
 message PutPolicyResponse {
@@ -62,12 +106,36 @@ message PutPolicyResponse {
   bool shadow = 3;
 }
 
+message GetPolicyRequest {
+  int64 version = 1;
+  string tenant = 2;
+}
+
+message Policy {
+  string tenant = 1;
+  int64 version = 2;
+  string rego = 3;
+  google.protobuf.Timestamp create_time = 4;
+}
+
 message PromotePolicyRequest {
   int64 version = 1;
+  string tenant = 2;
 }
 
 message PromotePolicyResponse {
   int64 active_version = 1;
+}
+
+message UnsetPolicyRequest {
+  // shadow=false clears the active slot, true clears the shadow slot.
+  bool shadow = 1;
+  string tenant = 2;
+}
+
+message UnsetPolicyResponse {
+  int64 active_version = 1;
+  int64 shadow_version = 2;
 }
 
 message AuditEvent {
@@ -105,3 +173,36 @@ message VerifyAuditChainResponse {
   // Set when ok=false: the first seq whose hash does not match.
   int64 broken_at_seq = 3;
 }
+
+message Tenant {
+  // Immutable, [a-z0-9][a-z0-9-]{0,62}; matches the `tenant` JWT claim.
+  string name = 1;
+  string display_name = 2;
+  // disabled=true makes every Check for the tenant deny (audited) without
+  // evaluating policy.
+  bool disabled = 3;
+  // Output only: the rollout state.
+  int64 active_version = 4;
+  int64 shadow_version = 5;
+  google.protobuf.Timestamp create_time = 6;
+}
+
+message PutTenantRequest {
+  Tenant tenant = 1;
+}
+
+message GetTenantRequest {
+  string name = 1;
+}
+
+message ListTenantsRequest {}
+
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+}
+
+message DeleteTenantRequest {
+  string name = 1;
+}
+
+message DeleteTenantResponse {}

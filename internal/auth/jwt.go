@@ -20,6 +20,9 @@ const (
 	ScopeCheck       = "policy:check"
 	ScopePolicyWrite = "policy:write"
 	ScopeAuditRead   = "audit:read"
+	// ScopeTenantAdmin manages the tenant registry and acts on any tenant's
+	// policies via the request's `tenant` field.
+	ScopeTenantAdmin = "tenants:admin"
 )
 
 type Claims struct {

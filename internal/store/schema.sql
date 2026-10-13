@@ -14,6 +14,13 @@ CREATE TABLE IF NOT EXISTS tenants (
     shadow_version bigint NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS tenant_registry (
+    tenant       text PRIMARY KEY,
+    display_name text        NOT NULL DEFAULT '',
+    disabled     boolean     NOT NULL DEFAULT false,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     tenant          text        NOT NULL,
     seq             bigint      NOT NULL,
@@ -43,3 +50,4 @@ DROP TRIGGER IF EXISTS audit_events_no_modify ON audit_events;
 CREATE TRIGGER audit_events_no_modify
     BEFORE UPDATE OR DELETE ON audit_events
     FOR EACH ROW EXECUTE FUNCTION audit_events_immutable();
+

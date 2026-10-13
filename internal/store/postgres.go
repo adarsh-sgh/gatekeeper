@@ -102,12 +102,53 @@ func (p *Postgres) GetPolicy(ctx context.Context, tenant string, version int64) 
 
 func (p *Postgres) GetTenantState(ctx context.Context, tenant string) (TenantState, error) {
 	var st TenantState
-	err := p.pool.QueryRow(ctx, `SELECT active_version, shadow_version FROM tenants WHERE tenant=$1`, tenant).
-		Scan(&st.Active, &st.Shadow)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return TenantState{}, nil
-	}
+	// One round trip on the Check hot path for rollout state and kill switch.
+	err := p.pool.QueryRow(ctx, `SELECT coalesce(t.active_version,0), coalesce(t.shadow_version,0), coalesce(r.disabled,false)
+		FROM (SELECT $1::text AS tenant) k LEFT JOIN tenants t USING (tenant) LEFT JOIN tenant_registry r USING (tenant)`, tenant).
+		Scan(&st.Active, &st.Shadow, &st.Disabled)
 	return st, err
+}
+
+func (p *Postgres) PutTenant(ctx context.Context, t Tenant) (Tenant, error) {
+	err := p.pool.QueryRow(ctx, `INSERT INTO tenant_registry (tenant, display_name, disabled) VALUES ($1,$2,$3)
+		ON CONFLICT (tenant) DO UPDATE SET display_name=EXCLUDED.display_name, disabled=EXCLUDED.disabled
+		RETURNING created_at`, t.Name, t.DisplayName, t.Disabled).Scan(&t.CreatedAt)
+	return t, err
+}
+
+func (p *Postgres) GetTenant(ctx context.Context, name string) (Tenant, error) {
+	t := Tenant{Name: name}
+	err := p.pool.QueryRow(ctx, `SELECT display_name, disabled, created_at FROM tenant_registry WHERE tenant=$1`, name).
+		Scan(&t.DisplayName, &t.Disabled, &t.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Tenant{}, ErrNotFound
+	}
+	return t, err
+}
+
+func (p *Postgres) ListTenants(ctx context.Context) ([]Tenant, error) {
+	rows, err := p.pool.Query(ctx, `SELECT tenant, display_name, disabled, created_at FROM tenant_registry ORDER BY tenant`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Tenant, error) {
+		var t Tenant
+		return t, r.Scan(&t.Name, &t.DisplayName, &t.Disabled, &t.CreatedAt)
+	})
+}
+
+func (p *Postgres) DeleteTenant(ctx context.Context, name string) error {
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM tenant_registry WHERE tenant=$1`, name)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		_, err = tx.Exec(ctx, `DELETE FROM tenants WHERE tenant=$1`, name)
+		return err
+	})
 }
 
 func (p *Postgres) SetTenantState(ctx context.Context, tenant string, st TenantState) error {
@@ -183,6 +224,11 @@ func (p *Postgres) readHead(ctx context.Context, q querier, tenant string) (head
 	return h, nil
 }
 
+const insertAudit = `INSERT INTO audit_events
+		(tenant, seq, ts, caller, subject, action, resource, policy_version, allowed, reason,
+		 shadow_version, shadow_allowed, shadow_diverged, prev_hash, hash)
+		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15 `
+
 // insert links ev after h and writes it, returning rows inserted (0 when
 // tryLock is set and the tenant's advisory lock is held elsewhere).
 func (p *Postgres) insert(ctx context.Context, q querier, ev *audit.Event, h head, tryLock bool) (int64, error) {
@@ -193,12 +239,9 @@ func (p *Postgres) insert(ctx context.Context, q querier, ev *audit.Event, h hea
 	if tryLock {
 		guard = `WHERE pg_try_advisory_xact_lock(hashtext($1))`
 	}
-	tag, err := q.Exec(ctx, `INSERT INTO audit_events
-		(tenant, seq, ts, caller, subject, action, resource, policy_version, allowed, reason,
-		 shadow_version, shadow_allowed, shadow_diverged, prev_hash, hash)
-		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15 `+guard,
-		ev.Tenant, ev.Seq, ev.TS, ev.Caller, subj, ev.Action, res, ev.PolicyVersion, ev.Allowed, ev.Reason,
-		ev.ShadowVersion, ev.ShadowAllowed, ev.ShadowDiverge, ev.PrevHash, ev.Hash)
+	sql, args := insertAudit+guard, []any{ev.Tenant, ev.Seq, ev.TS, ev.Caller, subj, ev.Action, res, ev.PolicyVersion,
+		ev.Allowed, ev.Reason, ev.ShadowVersion, ev.ShadowAllowed, ev.ShadowDiverge, ev.PrevHash, ev.Hash}
+	tag, err := q.Exec(ctx, sql, args...)
 	if err == nil && tag.RowsAffected() == 1 {
 		p.setHead(ev.Tenant, head{ev.Seq, ev.Hash})
 	}

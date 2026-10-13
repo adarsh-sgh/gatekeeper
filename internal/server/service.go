@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"regexp"
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -41,21 +43,32 @@ func (s *Service) Check(ctx context.Context, req *pb.CheckRequest) (*pb.CheckRes
 	if req.GetSubject().GetId() == "" || req.GetAction() == "" || req.GetResource().GetType() == "" {
 		return nil, status.Error(codes.InvalidArgument, "subject.id, action and resource.type are required")
 	}
+	ev, err := s.decide(ctx, claims, policy.Input{Tenant: claims.Tenant, Action: req.Action,
+		Subject:  audit.Subject{ID: req.Subject.Id, Roles: req.Subject.Roles, Attrs: req.Subject.GetAttrs().AsMap()},
+		Resource: audit.Resource{Type: req.Resource.Type, ID: req.Resource.Id, Attrs: req.Resource.GetAttrs().AsMap()}})
+	if err != nil {
+		return nil, err
+	}
+	return &pb.CheckResponse{Allowed: ev.Allowed, Reason: ev.Reason, PolicyVersion: ev.PolicyVersion, AuditSeq: ev.Seq}, nil
+}
+
+// decide evaluates in for claims.Tenant and appends the decision to the audit
+// chain; Check and the Envoy ext_authz adapter share it.
+func (s *Service) decide(ctx context.Context, claims *auth.Claims, in policy.Input) (audit.Event, error) {
 	tenant := claims.Tenant
 	st, err := s.store.GetTenantState(ctx, tenant)
 	if err != nil {
-		return nil, internal("get tenant state", err)
+		return audit.Event{}, internal("get tenant state", err)
 	}
-	in := policy.Input{Tenant: tenant, Action: req.Action,
-		Subject:  audit.Subject{ID: req.Subject.Id, Roles: req.Subject.Roles, Attrs: req.Subject.GetAttrs().AsMap()},
-		Resource: audit.Resource{Type: req.Resource.Type, ID: req.Resource.Id, Attrs: req.Resource.GetAttrs().AsMap()}}
-
 	ev := audit.Event{TS: time.Now().UTC(), Tenant: tenant, Caller: claims.Subject, Subject: in.Subject,
 		Action: in.Action, Resource: in.Resource, PolicyVersion: st.Active, Reason: "no active policy"}
+	if st.Disabled {
+		ev.Reason, st.Active, st.Shadow = "tenant disabled", 0, 0
+	}
 	if st.Active != 0 {
 		d, err := s.eval(ctx, tenant, st.Active, in)
 		if err != nil {
-			return nil, internal("evaluate policy", err)
+			return audit.Event{}, internal("evaluate policy", err)
 		}
 		ev.Allowed, ev.Reason = d.Allowed, d.Reason
 	}
@@ -72,10 +85,10 @@ func (s *Service) Check(ctx context.Context, req *pb.CheckRequest) (*pb.CheckRes
 		}
 	}
 	if err := s.store.AppendAudit(ctx, &ev); err != nil {
-		return nil, internal("append audit", err)
+		return audit.Event{}, internal("append audit", err)
 	}
 	metrics.Checks.WithLabelValues(tenant, decisionLabel(ev.Allowed)).Inc()
-	return &pb.CheckResponse{Allowed: ev.Allowed, Reason: ev.Reason, PolicyVersion: ev.PolicyVersion, AuditSeq: ev.Seq}, nil
+	return ev, nil
 }
 
 func (s *Service) eval(ctx context.Context, tenant string, version int64, in policy.Input) (policy.Decision, error) {
@@ -92,15 +105,18 @@ func (s *Service) eval(ctx context.Context, tenant string, version int64, in pol
 }
 
 func (s *Service) PutPolicy(ctx context.Context, req *pb.PutPolicyRequest) (*pb.PutPolicyResponse, error) {
-	claims, err := requireScope(ctx, auth.ScopePolicyWrite)
+	claims, tenant, err := forTenant(ctx, auth.ScopePolicyWrite, req.Tenant)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := policy.Compile(ctx, req.Rego); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	tenant := claims.Tenant
-	p, created, err := s.store.PutPolicy(ctx, tenant, req.Rego, req.IdempotencyKey)
+	key := req.IdempotencyKey
+	if md, _ := metadata.FromIncomingContext(ctx); key == "" && len(md.Get("idempotency-key")) > 0 {
+		key = md.Get("idempotency-key")[0] // HTTP Idempotency-Key header via the gateway
+	}
+	p, created, err := s.store.PutPolicy(ctx, tenant, req.Rego, key)
 	if errors.Is(err, store.ErrIdempotencyMismatch) {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
@@ -125,12 +141,25 @@ func (s *Service) PutPolicy(ctx context.Context, req *pb.PutPolicyRequest) (*pb.
 	return &pb.PutPolicyResponse{Version: p.Version, Created: created, Shadow: st.Shadow == p.Version}, nil
 }
 
-func (s *Service) PromotePolicy(ctx context.Context, req *pb.PromotePolicyRequest) (*pb.PromotePolicyResponse, error) {
-	claims, err := requireScope(ctx, auth.ScopePolicyWrite)
+func (s *Service) GetPolicy(ctx context.Context, req *pb.GetPolicyRequest) (*pb.Policy, error) {
+	_, tenant, err := forTenant(ctx, auth.ScopePolicyWrite, req.Tenant)
 	if err != nil {
 		return nil, err
 	}
-	tenant := claims.Tenant
+	p, err := s.store.GetPolicy(ctx, tenant, req.Version)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, status.Errorf(codes.NotFound, "policy version %d not found", req.Version)
+	} else if err != nil {
+		return nil, internal("get policy", err)
+	}
+	return &pb.Policy{Tenant: p.Tenant, Version: p.Version, Rego: p.Rego, CreateTime: timestamppb.New(p.CreatedAt)}, nil
+}
+
+func (s *Service) PromotePolicy(ctx context.Context, req *pb.PromotePolicyRequest) (*pb.PromotePolicyResponse, error) {
+	claims, tenant, err := forTenant(ctx, auth.ScopePolicyWrite, req.Tenant)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := s.store.GetPolicy(ctx, tenant, req.Version); errors.Is(err, store.ErrNotFound) {
 		return nil, status.Errorf(codes.NotFound, "policy version %d not found", req.Version)
 	} else if err != nil {
@@ -149,6 +178,100 @@ func (s *Service) PromotePolicy(ctx context.Context, req *pb.PromotePolicyReques
 	}
 	s.log.Info("policy promoted", "tenant", tenant, "version", req.Version, "by", claims.Subject)
 	return &pb.PromotePolicyResponse{ActiveVersion: st.Active}, nil
+}
+
+func (s *Service) UnsetPolicy(ctx context.Context, req *pb.UnsetPolicyRequest) (*pb.UnsetPolicyResponse, error) {
+	claims, tenant, err := forTenant(ctx, auth.ScopePolicyWrite, req.Tenant)
+	if err != nil {
+		return nil, err
+	}
+	st, err := s.store.GetTenantState(ctx, tenant)
+	if err != nil {
+		return nil, internal("get tenant state", err)
+	}
+	if req.Shadow {
+		st.Shadow = 0
+	} else {
+		st.Active = 0
+	}
+	if err := s.store.SetTenantState(ctx, tenant, st); err != nil {
+		return nil, internal("set tenant state", err)
+	}
+	s.log.Info("policy unset", "tenant", tenant, "shadow", req.Shadow, "by", claims.Subject)
+	return &pb.UnsetPolicyResponse{ActiveVersion: st.Active, ShadowVersion: st.Shadow}, nil
+}
+
+var tenantName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+func (s *Service) PutTenant(ctx context.Context, req *pb.PutTenantRequest) (*pb.Tenant, error) {
+	claims, err := requireScope(ctx, auth.ScopeTenantAdmin)
+	if err != nil {
+		return nil, err
+	}
+	t := req.GetTenant()
+	if !tenantName.MatchString(t.GetName()) {
+		return nil, status.Errorf(codes.InvalidArgument, "tenant name %q must match %s", t.GetName(), tenantName)
+	}
+	if _, err := s.store.PutTenant(ctx, store.Tenant{Name: t.Name, DisplayName: t.DisplayName, Disabled: t.Disabled}); err != nil {
+		return nil, internal("put tenant", err)
+	}
+	s.log.Info("tenant stored", "tenant", t.Name, "disabled", t.Disabled, "by", claims.Subject)
+	return s.GetTenant(ctx, &pb.GetTenantRequest{Name: t.Name})
+}
+
+func (s *Service) GetTenant(ctx context.Context, req *pb.GetTenantRequest) (*pb.Tenant, error) {
+	if _, err := requireScope(ctx, auth.ScopeTenantAdmin); err != nil {
+		return nil, err
+	}
+	t, err := s.store.GetTenant(ctx, req.Name)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, status.Errorf(codes.NotFound, "tenant %q not found", req.Name)
+	} else if err != nil {
+		return nil, internal("get tenant", err)
+	}
+	return s.tenantProto(ctx, t)
+}
+
+func (s *Service) ListTenants(ctx context.Context, _ *pb.ListTenantsRequest) (*pb.ListTenantsResponse, error) {
+	if _, err := requireScope(ctx, auth.ScopeTenantAdmin); err != nil {
+		return nil, err
+	}
+	ts, err := s.store.ListTenants(ctx)
+	if err != nil {
+		return nil, internal("list tenants", err)
+	}
+	out := &pb.ListTenantsResponse{Tenants: make([]*pb.Tenant, 0, len(ts))}
+	for _, t := range ts {
+		pt, err := s.tenantProto(ctx, t)
+		if err != nil {
+			return nil, err
+		}
+		out.Tenants = append(out.Tenants, pt)
+	}
+	return out, nil
+}
+
+func (s *Service) DeleteTenant(ctx context.Context, req *pb.DeleteTenantRequest) (*pb.DeleteTenantResponse, error) {
+	claims, err := requireScope(ctx, auth.ScopeTenantAdmin)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.DeleteTenant(ctx, req.Name); errors.Is(err, store.ErrNotFound) {
+		return nil, status.Errorf(codes.NotFound, "tenant %q not found", req.Name)
+	} else if err != nil {
+		return nil, internal("delete tenant", err)
+	}
+	s.log.Info("tenant deleted", "tenant", req.Name, "by", claims.Subject)
+	return &pb.DeleteTenantResponse{}, nil
+}
+
+func (s *Service) tenantProto(ctx context.Context, t store.Tenant) (*pb.Tenant, error) {
+	st, err := s.store.GetTenantState(ctx, t.Name)
+	if err != nil {
+		return nil, internal("get tenant state", err)
+	}
+	return &pb.Tenant{Name: t.Name, DisplayName: t.DisplayName, Disabled: t.Disabled,
+		ActiveVersion: st.Active, ShadowVersion: st.Shadow, CreateTime: timestamppb.New(t.CreatedAt)}, nil
 }
 
 func (s *Service) ListAuditEvents(ctx context.Context, req *pb.ListAuditEventsRequest) (*pb.ListAuditEventsResponse, error) {
@@ -192,6 +315,22 @@ func (s *Service) VerifyAuditChain(ctx context.Context, _ *pb.VerifyAuditChainRe
 		}
 		after = page[len(page)-1].Seq
 	}
+}
+
+// forTenant resolves the tenant an admin RPC acts on: the caller's own by
+// default, another one only with scope tenants:admin.
+func forTenant(ctx context.Context, scope, requested string) (*auth.Claims, string, error) {
+	c, err := requireScope(ctx, scope)
+	if err != nil {
+		return nil, "", err
+	}
+	if requested == "" || requested == c.Tenant {
+		return c, c.Tenant, nil
+	}
+	if !c.HasScope(auth.ScopeTenantAdmin) {
+		return nil, "", status.Errorf(codes.PermissionDenied, "scope %q required to act on tenant %q", auth.ScopeTenantAdmin, requested)
+	}
+	return c, requested, nil
 }
 
 func requireScope(ctx context.Context, scope string) (*auth.Claims, error) {

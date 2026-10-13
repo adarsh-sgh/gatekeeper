@@ -6,6 +6,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"flag"
 	"fmt"
@@ -15,9 +16,11 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
@@ -98,11 +101,18 @@ func run(c config, log *slog.Logger) error {
 		}
 		c.issuer, c.jwksURL = iss.Name, "http://"+net.JoinHostPort(host, port)+"/dev/jwks.json"
 		extra["GET /dev/jwks.json"] = http.HandlerFunc(iss.JWKS)
-		extra["GET /dev/token"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { // load tests, one token per tenant
-			w.Write([]byte(iss.Mint("dev-admin", r.URL.Query().Get("tenant"), nil, auth.ScopeCheck+" "+auth.ScopePolicyWrite, time.Hour)))
+		// Load tests and e2e: ?tenant=t[&sub=u&roles=a,b&scope=...]; one token per tenant/user.
+		extra["GET /dev/token"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			sub, scope := cmp.Or(q.Get("sub"), "dev-admin"), cmp.Or(q.Get("scope"), auth.ScopeCheck+" "+auth.ScopePolicyWrite)
+			var roles []string
+			if q.Get("roles") != "" {
+				roles = strings.Split(q.Get("roles"), ",")
+			}
+			w.Write([]byte(iss.Mint(sub, q.Get("tenant"), roles, scope, time.Hour)))
 		})
 		tok := iss.Mint("dev-admin", "acme", []string{"admin"},
-			auth.ScopeCheck+" "+auth.ScopePolicyWrite+" "+auth.ScopeAuditRead, 12*time.Hour)
+			auth.ScopeCheck+" "+auth.ScopePolicyWrite+" "+auth.ScopeAuditRead+" "+auth.ScopeTenantAdmin, 12*time.Hour)
 		fmt.Printf("export TOKEN=%s\n", tok)
 		if c.devRotate > 0 {
 			if err := iss.PrepareNext(); err != nil {
@@ -139,6 +149,7 @@ func run(c config, log *slog.Logger) error {
 	}
 	gs := grpc.NewServer(gopts...)
 	pb.RegisterGatekeeperServer(gs, svc)
+	authv3.RegisterAuthorizationServer(gs, server.NewExtAuthz(svc, opts))
 	health.Register(gs)
 	glis, err := net.Listen("tcp", c.grpcAddr)
 	if err != nil {

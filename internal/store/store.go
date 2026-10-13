@@ -23,10 +23,21 @@ type Policy struct {
 }
 
 // TenantState is the rollout state: which version is served and which (if
-// any) is evaluated in shadow mode. 0 means none.
+// any) is evaluated in shadow mode. 0 means none. Disabled is read from the
+// tenant registry in the same query; SetTenantState ignores it.
 type TenantState struct {
-	Active int64
-	Shadow int64
+	Active   int64
+	Shadow   int64
+	Disabled bool
+}
+
+// Tenant is a registry entry. Unregistered tenants still work (the tenant
+// comes from the token); registering adds metadata and a kill switch.
+type Tenant struct {
+	Name        string
+	DisplayName string
+	Disabled    bool
+	CreatedAt   time.Time
 }
 
 type Store interface {
@@ -41,6 +52,12 @@ type Store interface {
 	AppendAudit(ctx context.Context, ev *audit.Event) error
 	// ListAudit returns up to limit events with seq > afterSeq, ascending.
 	ListAudit(ctx context.Context, tenant string, afterSeq int64, limit int) ([]audit.Event, error)
+	// PutTenant upserts a registry entry; CreatedAt is kept from the first put.
+	PutTenant(ctx context.Context, t Tenant) (Tenant, error)
+	GetTenant(ctx context.Context, name string) (Tenant, error)
+	ListTenants(ctx context.Context) ([]Tenant, error)
+	// DeleteTenant unregisters the tenant and zeroes its rollout state.
+	DeleteTenant(ctx context.Context, name string) error
 	// Ping reports whether the backing store is reachable; readiness depends on it.
 	Ping(ctx context.Context) error
 	Close() error

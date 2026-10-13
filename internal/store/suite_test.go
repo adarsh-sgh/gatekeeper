@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,41 @@ func runSuite(t *testing.T, s Store) {
 		}
 		if st, _ := s.GetTenantState(ctx, tenant); st != want {
 			t.Fatalf("state = %+v", st)
+		}
+	})
+
+	t.Run("tenant registry", func(t *testing.T) {
+		name := tenant + "-reg"
+		if _, err := s.GetTenant(ctx, name); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unregistered: %v", err)
+		}
+		first, err := s.PutTenant(ctx, Tenant{Name: name, DisplayName: "A"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.PutTenant(ctx, Tenant{Name: name, DisplayName: "B", Disabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetTenant(ctx, name)
+		if err != nil || got.DisplayName != "B" || !got.Disabled || !got.CreatedAt.Equal(first.CreatedAt) {
+			t.Fatalf("after upsert: %+v err=%v (first %+v)", got, err, first)
+		}
+		s.SetTenantState(ctx, name, TenantState{Active: 3})
+		if st, _ := s.GetTenantState(ctx, name); st != (TenantState{Active: 3, Disabled: true}) {
+			t.Fatalf("state carries kill switch: %+v", st)
+		}
+		all, _ := s.ListTenants(ctx)
+		if !slices.ContainsFunc(all, func(x Tenant) bool { return x.Name == name }) {
+			t.Fatalf("list misses %s", name)
+		}
+		if err := s.DeleteTenant(ctx, name); err != nil {
+			t.Fatal(err)
+		}
+		if st, _ := s.GetTenantState(ctx, name); st != (TenantState{}) {
+			t.Fatalf("delete must clear rollout: %+v", st)
+		}
+		if err := s.DeleteTenant(ctx, name); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("double delete: %v", err)
 		}
 	})
 

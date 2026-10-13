@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,12 +16,13 @@ type Memory struct {
 	policies map[string][]Policy // tenant -> versions (index = version-1)
 	idem     map[string]Policy   // tenant+"\x00"+key
 	tenants  map[string]TenantState
+	registry map[string]Tenant
 	events   map[string][]audit.Event
 }
 
 func NewMemory() *Memory {
 	return &Memory{policies: map[string][]Policy{}, idem: map[string]Policy{},
-		tenants: map[string]TenantState{}, events: map[string][]audit.Event{}}
+		tenants: map[string]TenantState{}, registry: map[string]Tenant{}, events: map[string][]audit.Event{}}
 }
 
 func (m *Memory) PutPolicy(_ context.Context, tenant, rego, idemKey string) (Policy, bool, error) {
@@ -55,13 +58,59 @@ func (m *Memory) GetPolicy(_ context.Context, tenant string, version int64) (Pol
 func (m *Memory) GetTenantState(_ context.Context, tenant string) (TenantState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.tenants[tenant], nil
+	st := m.tenants[tenant]
+	st.Disabled = m.registry[tenant].Disabled
+	return st, nil
 }
 
 func (m *Memory) SetTenantState(_ context.Context, tenant string, st TenantState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	st.Disabled = false
 	m.tenants[tenant] = st
+	return nil
+}
+
+func (m *Memory) PutTenant(_ context.Context, t Tenant) (Tenant, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t.CreatedAt = time.Now().UTC()
+	if old, ok := m.registry[t.Name]; ok {
+		t.CreatedAt = old.CreatedAt
+	}
+	m.registry[t.Name] = t
+	return t, nil
+}
+
+func (m *Memory) GetTenant(_ context.Context, name string) (Tenant, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.registry[name]
+	if !ok {
+		return Tenant{}, ErrNotFound
+	}
+	return t, nil
+}
+
+func (m *Memory) ListTenants(context.Context) ([]Tenant, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Tenant, 0, len(m.registry))
+	for _, t := range m.registry {
+		out = append(out, t)
+	}
+	slices.SortFunc(out, func(a, b Tenant) int { return strings.Compare(a.Name, b.Name) })
+	return out, nil
+}
+
+func (m *Memory) DeleteTenant(_ context.Context, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.registry[name]; !ok {
+		return ErrNotFound
+	}
+	delete(m.registry, name)
+	delete(m.tenants, name)
 	return nil
 }
 

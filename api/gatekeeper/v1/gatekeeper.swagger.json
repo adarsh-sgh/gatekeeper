@@ -1,0 +1,716 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "gatekeeper/v1/gatekeeper.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "Gatekeeper",
+      "description": "Gatekeeper is a multi-tenant policy decision point. The tenant is taken\nfrom the caller's JWT, never from the request body; the only exception is\nthe optional `tenant` field on admin RPCs, which needs scope tenants:admin.\n\nThis file is the single source of truth: buf generates the gRPC server and\nclient (the Go SDK), the grpc-gateway HTTP/JSON routes below and an\nOpenAPI document from it."
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v1/audit": {
+      "get": {
+        "operationId": "Gatekeeper_ListAuditEvents",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListAuditEventsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "afterSeq",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "int64"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/audit/verify": {
+      "get": {
+        "summary": "VerifyAuditChain re-hashes the tenant's audit log and reports the first break.",
+        "operationId": "Gatekeeper_VerifyAuditChain",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1VerifyAuditChainResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/check": {
+      "post": {
+        "summary": "Check evaluates (subject, action, resource) against the tenant's active\npolicy and appends the decision to the tenant's audit chain.",
+        "operationId": "Gatekeeper_Check",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CheckResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1CheckRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/policies": {
+      "put": {
+        "summary": "PutPolicy stores a new Rego policy version. Idempotent on idempotency_key\n(also read from the Idempotency-Key header / metadata).",
+        "operationId": "Gatekeeper_PutPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1PutPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1PutPolicyRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/policies/{version}": {
+      "get": {
+        "operationId": "Gatekeeper_GetPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Policy"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "format": "int64"
+          },
+          {
+            "name": "tenant",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/policies/{version}/promote": {
+      "post": {
+        "summary": "PromotePolicy makes a stored version the active one.",
+        "operationId": "Gatekeeper_PromotePolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1PromotePolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "format": "int64"
+          },
+          {
+            "name": "tenant",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/policies:unset": {
+      "post": {
+        "summary": "UnsetPolicy clears the active (or shadow) slot. With no active policy\nevery Check denies: removing a policy fails closed.",
+        "operationId": "Gatekeeper_UnsetPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1UnsetPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1UnsetPolicyRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/tenants": {
+      "get": {
+        "operationId": "Gatekeeper_ListTenants",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListTenantsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/tenants/{name}": {
+      "get": {
+        "operationId": "Gatekeeper_GetTenant",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Tenant"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      },
+      "delete": {
+        "summary": "DeleteTenant unregisters the tenant and clears its rollout state. Policy\nversions and the audit chain are immutable history and are kept.",
+        "operationId": "Gatekeeper_DeleteTenant",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1DeleteTenantResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant.name}": {
+      "put": {
+        "summary": "Tenant registry (scope tenants:admin). Tokens for unregistered tenants\nstill work; registering adds metadata and the `disabled` kill switch.",
+        "operationId": "Gatekeeper_PutTenant",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1Tenant"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "tenant.name",
+            "description": "Immutable, [a-z0-9][a-z0-9-]{0,62}; matches the `tenant` JWT claim.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "tenant",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "displayName": {
+                  "type": "string"
+                },
+                "disabled": {
+                  "type": "boolean",
+                  "description": "disabled=true makes every Check for the tenant deny (audited) without\nevaluating policy."
+                },
+                "activeVersion": {
+                  "type": "string",
+                  "format": "int64",
+                  "description": "Output only: the rollout state."
+                },
+                "shadowVersion": {
+                  "type": "string",
+                  "format": "int64"
+                },
+                "createTime": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          }
+        ],
+        "tags": [
+          "Gatekeeper"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "protobufNullValue": {
+      "type": "string",
+      "enum": [
+        "NULL_VALUE"
+      ],
+      "default": "NULL_VALUE",
+      "description": "Represents a JSON `null`.\n\n`NullValue` is a sentinel, using an enum with only one value to represent\nthe null value for the `Value` type union.\n\nA field of type `NullValue` with any value other than `0` is considered\ninvalid. Most ProtoJSON serializers will emit a Value with a `null_value` set\nas a JSON `null` regardless of the integer value, and so will round trip to\na `0` value.\n\n - NULL_VALUE: Null value."
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v1AuditEvent": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "string",
+          "format": "int64"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "caller": {
+          "type": "string"
+        },
+        "subject": {
+          "$ref": "#/definitions/v1Subject"
+        },
+        "action": {
+          "type": "string"
+        },
+        "resource": {
+          "$ref": "#/definitions/v1Resource"
+        },
+        "policyVersion": {
+          "type": "string",
+          "format": "int64"
+        },
+        "allowed": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "shadowVersion": {
+          "type": "string",
+          "format": "int64"
+        },
+        "shadowAllowed": {
+          "type": "boolean"
+        },
+        "shadowDiverged": {
+          "type": "boolean"
+        },
+        "prevHash": {
+          "type": "string"
+        },
+        "hash": {
+          "type": "string"
+        }
+      }
+    },
+    "v1CheckRequest": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "$ref": "#/definitions/v1Subject"
+        },
+        "action": {
+          "type": "string"
+        },
+        "resource": {
+          "$ref": "#/definitions/v1Resource"
+        }
+      }
+    },
+    "v1CheckResponse": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "policyVersion": {
+          "type": "string",
+          "format": "int64"
+        },
+        "auditSeq": {
+          "type": "string",
+          "format": "int64"
+        }
+      }
+    },
+    "v1DeleteTenantResponse": {
+      "type": "object"
+    },
+    "v1ListAuditEventsResponse": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1AuditEvent"
+          }
+        }
+      }
+    },
+    "v1ListTenantsResponse": {
+      "type": "object",
+      "properties": {
+        "tenants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Tenant"
+          }
+        }
+      }
+    },
+    "v1Policy": {
+      "type": "object",
+      "properties": {
+        "tenant": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string",
+          "format": "int64"
+        },
+        "rego": {
+          "type": "string"
+        },
+        "createTime": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1PromotePolicyResponse": {
+      "type": "object",
+      "properties": {
+        "activeVersion": {
+          "type": "string",
+          "format": "int64"
+        }
+      }
+    },
+    "v1PutPolicyRequest": {
+      "type": "object",
+      "properties": {
+        "rego": {
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "shadow": {
+          "type": "boolean",
+          "description": "shadow=true installs the version alongside the active one: it is evaluated\non every Check and divergence is logged, but the old decision is served."
+        },
+        "tenant": {
+          "type": "string",
+          "description": "Empty means the caller's tenant."
+        }
+      }
+    },
+    "v1PutPolicyResponse": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string",
+          "format": "int64"
+        },
+        "created": {
+          "type": "boolean",
+          "description": "created=false means the idempotency key matched an earlier request."
+        },
+        "shadow": {
+          "type": "boolean"
+        }
+      }
+    },
+    "v1Resource": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "attrs": {
+          "type": "object"
+        }
+      }
+    },
+    "v1Subject": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "attrs": {
+          "type": "object"
+        }
+      }
+    },
+    "v1Tenant": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Immutable, [a-z0-9][a-z0-9-]{0,62}; matches the `tenant` JWT claim."
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "disabled": {
+          "type": "boolean",
+          "description": "disabled=true makes every Check for the tenant deny (audited) without\nevaluating policy."
+        },
+        "activeVersion": {
+          "type": "string",
+          "format": "int64",
+          "description": "Output only: the rollout state."
+        },
+        "shadowVersion": {
+          "type": "string",
+          "format": "int64"
+        },
+        "createTime": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1UnsetPolicyRequest": {
+      "type": "object",
+      "properties": {
+        "shadow": {
+          "type": "boolean",
+          "description": "shadow=false clears the active slot, true clears the shadow slot."
+        },
+        "tenant": {
+          "type": "string"
+        }
+      }
+    },
+    "v1UnsetPolicyResponse": {
+      "type": "object",
+      "properties": {
+        "activeVersion": {
+          "type": "string",
+          "format": "int64"
+        },
+        "shadowVersion": {
+          "type": "string",
+          "format": "int64"
+        }
+      }
+    },
+    "v1VerifyAuditChainResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "eventsChecked": {
+          "type": "string",
+          "format": "int64"
+        },
+        "brokenAtSeq": {
+          "type": "string",
+          "format": "int64",
+          "description": "Set when ok=false: the first seq whose hash does not match."
+        }
+      }
+    }
+  }
+}

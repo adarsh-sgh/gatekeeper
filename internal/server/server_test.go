@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -33,6 +34,7 @@ const allScopes = auth.ScopeCheck + " " + auth.ScopePolicyWrite + " " + auth.Sco
 type env struct {
 	iss    *auth.Issuer
 	grpc   pb.GatekeeperClient
+	authz  authv3.AuthorizationClient
 	http   *httptest.Server
 	health *Health
 }
@@ -58,6 +60,7 @@ func newEnv(t *testing.T, limiter ...*ratelimit.Limiter) *env {
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer(GRPCInterceptors(o))
 	pb.RegisterGatekeeperServer(gs, svc)
+	authv3.RegisterAuthorizationServer(gs, NewExtAuthz(svc, o))
 	o.Health.Register(gs)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
@@ -69,7 +72,7 @@ func newEnv(t *testing.T, limiter ...*ratelimit.Limiter) *env {
 	t.Cleanup(func() { conn.Close() })
 	hs := httptest.NewServer(NewHTTPHandler(svc, o))
 	t.Cleanup(hs.Close)
-	return &env{iss: iss, grpc: pb.NewGatekeeperClient(conn), http: hs, health: o.Health}
+	return &env{iss: iss, grpc: pb.NewGatekeeperClient(conn), authz: authv3.NewAuthorizationClient(conn), http: hs, health: o.Health}
 }
 
 func (e *env) ctx(sub, tenant, scope string) context.Context {
@@ -332,5 +335,144 @@ func TestRequestIDsAndReadiness(t *testing.T) {
 	}
 	if _, err := e.grpc.Check(e.ctx("svc", "acme", auth.ScopeCheck), check); err != nil {
 		t.Fatalf("draining must not reject requests: %v", err)
+	}
+}
+
+// Tenant registry and cross-tenant admin: a tenants:admin token manages any
+// tenant's policies via the tenant field; a plain token cannot. Disabling a
+// tenant and unsetting its policy both fail closed, and deleting it clears
+// the rollout. The same RPCs answer on the generated HTTP routes.
+func TestTenantAdmin(t *testing.T) {
+	e := newEnv(t)
+	root := e.ctx("ops", "root", allScopes+" "+auth.ScopeTenantAdmin)
+	acme := e.ctx("svc", "acme", allScopes)
+	check := &pb.CheckRequest{Subject: &pb.Subject{Id: "u"}, Action: "read", Resource: &pb.Resource{Type: "doc"}}
+
+	if _, err := e.grpc.PutTenant(root, &pb.PutTenantRequest{Tenant: &pb.Tenant{Name: "Bad Name"}}); code(err) != codes.InvalidArgument {
+		t.Fatalf("bad name: %v", err)
+	}
+	if _, err := e.grpc.PutTenant(acme, &pb.PutTenantRequest{Tenant: &pb.Tenant{Name: "acme"}}); code(err) != codes.PermissionDenied {
+		t.Fatalf("non-admin put tenant: %v", err)
+	}
+	if _, err := e.grpc.PutPolicy(acme, &pb.PutPolicyRequest{Tenant: "globex", Rego: "package gatekeeper"}); code(err) != codes.PermissionDenied {
+		t.Fatalf("cross-tenant without admin: %v", err)
+	}
+	tn, err := e.grpc.PutTenant(root, &pb.PutTenantRequest{Tenant: &pb.Tenant{Name: "acme", DisplayName: "Acme"}})
+	if err != nil || tn.DisplayName != "Acme" || tn.CreateTime == nil {
+		t.Fatalf("put tenant: %+v %v", tn, err)
+	}
+	p, err := e.grpc.PutPolicy(root, &pb.PutPolicyRequest{Tenant: "acme", Rego: "package gatekeeper\nallow := true"})
+	if err != nil || p.Version != 1 {
+		t.Fatalf("admin put policy for acme: %+v %v", p, err)
+	}
+	if got, err := e.grpc.GetPolicy(root, &pb.GetPolicyRequest{Tenant: "acme", Version: 1}); err != nil || !strings.Contains(got.Rego, "allow := true") {
+		t.Fatalf("get policy: %+v %v", got, err)
+	}
+	if r, _ := e.grpc.Check(acme, check); !r.Allowed {
+		t.Fatalf("acme check after admin put: %+v", r)
+	}
+	if tn, _ = e.grpc.GetTenant(root, &pb.GetTenantRequest{Name: "acme"}); tn.ActiveVersion != 1 {
+		t.Fatalf("tenant rollout state: %+v", tn)
+	}
+
+	// Kill switch, then re-enable.
+	e.grpc.PutTenant(root, &pb.PutTenantRequest{Tenant: &pb.Tenant{Name: "acme", Disabled: true}})
+	if r, _ := e.grpc.Check(acme, check); r.Allowed || r.Reason != "tenant disabled" || r.AuditSeq == 0 {
+		t.Fatalf("disabled tenant must deny, audited: %+v", r)
+	}
+	e.grpc.PutTenant(root, &pb.PutTenantRequest{Tenant: &pb.Tenant{Name: "acme"}})
+	if u, err := e.grpc.UnsetPolicy(root, &pb.UnsetPolicyRequest{Tenant: "acme"}); err != nil || u.ActiveVersion != 0 {
+		t.Fatalf("unset: %+v %v", u, err)
+	}
+	if r, _ := e.grpc.Check(acme, check); r.Allowed || r.Reason != "no active policy" {
+		t.Fatalf("unset must fail closed: %+v", r)
+	}
+
+	// HTTP: generated routes for the registry.
+	tok := e.iss.Mint("ops", "root", nil, auth.ScopeTenantAdmin, time.Minute)
+	req, _ := http.NewRequest("PUT", e.http.URL+"/v1/tenants/globex", strings.NewReader(`{"displayName":"Globex"}`))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("http put tenant: %v %v", resp.StatusCode, err)
+	}
+	req, _ = http.NewRequest("GET", e.http.URL+"/v1/tenants", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, _ := http.DefaultClient.Do(req)
+	var list struct{ Tenants []struct{ Name, DisplayName string } }
+	json.NewDecoder(resp.Body).Decode(&list)
+	if len(list.Tenants) != 2 || list.Tenants[1].Name != "globex" || list.Tenants[1].DisplayName != "Globex" {
+		t.Fatalf("http list tenants: %+v", list)
+	}
+
+	if _, err := e.grpc.DeleteTenant(root, &pb.DeleteTenantRequest{Name: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.grpc.GetTenant(root, &pb.GetTenantRequest{Name: "acme"}); code(err) != codes.NotFound {
+		t.Fatalf("deleted tenant: %v", err)
+	}
+	if _, err := e.grpc.DeleteTenant(root, &pb.DeleteTenantRequest{Name: "acme"}); code(err) != codes.NotFound {
+		t.Fatalf("double delete: %v", err)
+	}
+}
+
+// Envoy ext_authz adapter: the forwarded end-user token picks tenant and
+// subject, the HTTP method/path become action/resource, and the decision is
+// audited like any Check.
+func TestExtAuthz(t *testing.T) {
+	e := newEnv(t)
+	admin := e.ctx("ops", "acme", allScopes)
+	rego, err := os.ReadFile("../../policies/http.rego")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.grpc.PutPolicy(admin, &pb.PutPolicyRequest{Rego: string(rego)}); err != nil {
+		t.Fatal(err)
+	}
+	call := func(method, path, sub string, roles ...string) *authv3.CheckResponse {
+		t.Helper()
+		hdrs := map[string]string{}
+		if sub != "" {
+			hdrs["authorization"] = "Bearer " + e.iss.Mint(sub, "acme", roles, "", time.Minute)
+		}
+		r, err := e.authz.Check(context.Background(), &authv3.CheckRequest{Attributes: &authv3.AttributeContext{
+			Request: &authv3.AttributeContext_Request{Http: &authv3.AttributeContext_HttpRequest{
+				Method: method, Path: path, Host: "api.test", Headers: hdrs}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	httpStatus := func(r *authv3.CheckResponse) int {
+		if r.GetOkResponse() != nil {
+			return 200
+		}
+		return int(r.GetDeniedResponse().GetStatus().GetCode())
+	}
+	cases := []struct {
+		method, path, sub string
+		roles             []string
+		want              int
+	}{
+		{"GET", "/docs/1", "", nil, 401},
+		{"GET", "/public/readme?x=1", "u1", nil, 200},
+		{"GET", "/docs/1", "u1", nil, 403},
+		{"GET", "/docs/1", "u2", []string{"viewer"}, 200},
+		{"DELETE", "/docs/1", "u2", []string{"viewer"}, 403},
+		{"DELETE", "/docs/1", "u3", []string{"admin"}, 200},
+	}
+	for _, c := range cases {
+		if got := httpStatus(call(c.method, c.path, c.sub, c.roles...)); got != c.want {
+			t.Errorf("%s %s as %s%v: %d, want %d", c.method, c.path, c.sub, c.roles, got, c.want)
+		}
+	}
+	evs, _ := e.grpc.ListAuditEvents(admin, &pb.ListAuditEventsRequest{})
+	if len(evs.Events) != 5 { // the 401 never reaches policy
+		t.Fatalf("audited %d ext_authz decisions, want 5", len(evs.Events))
+	}
+	if last := evs.Events[4]; last.Subject.Id != "u3" || last.Action != "write" || last.Resource.Id != "/docs/1" || !last.Allowed {
+		t.Fatalf("last audit event: %+v", last)
+	}
+	if public := evs.Events[0]; public.Resource.Id != "/public/readme" {
+		t.Fatalf("query string must not reach the resource id: %q", public.Resource.Id)
 	}
 }

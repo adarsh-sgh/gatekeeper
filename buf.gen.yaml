@@ -1,0 +1,16 @@
+# One spec, four outputs: messages, gRPC server+client (the Go SDK), the
+# grpc-gateway HTTP/JSON mux and an OpenAPI document. Plugins are pinned in go.mod.
+version: v2
+plugins:
+  - local: [go, tool, protoc-gen-go]
+    out: api
+    opt: paths=source_relative
+  - local: [go, tool, protoc-gen-go-grpc]
+    out: api
+    opt: paths=source_relative
+  - local: [go, tool, protoc-gen-grpc-gateway]
+    out: api
+    opt: paths=source_relative
+  - local: [go, tool, protoc-gen-openapiv2]
+    out: api
+    opt: allow_merge=false
