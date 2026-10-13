@@ -102,3 +102,67 @@ func TestPostgresAuditIsTamperEvident(t *testing.T) {
 		t.Fatalf("Verify = %d, want 2", broken)
 	}
 }
+
+// With the outbox on, racing instances (PK conflicts, retries, the locked
+// slow path) still leave exactly one outbox row per committed audit event,
+// carrying that event's id and hash.
+func TestPostgresOutboxMatchesAudit(t *testing.T) {
+	dsn := os.Getenv("PG_DSN")
+	if dsn == "" {
+		t.Skip("PG_DSN not set")
+	}
+	var insts []*Postgres
+	for range 2 {
+		s, err := NewPostgres(context.Background(), dsn, WithOutbox())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		insts = append(insts, s)
+	}
+	ctx := context.Background()
+	tenant := "outbox-" + time.Now().Format("150405.000000")
+	var wg sync.WaitGroup
+	for _, s := range insts {
+		for i := range 50 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := s.AppendAudit(ctx, &audit.Event{TS: time.Now(), Tenant: tenant, Caller: "svc", Action: "read",
+					Subject: audit.Subject{ID: fmt.Sprint("u", i)}, Resource: audit.Resource{Type: "doc"}, Allowed: i%2 == 0}); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	evs, err := insts[0].ListAudit(ctx, tenant, 0, 1000)
+	if err != nil || len(evs) != 100 {
+		t.Fatalf("events: %d %v", len(evs), err)
+	}
+	rows, err := insts[0].pool.Query(ctx, `SELECT event_id, payload FROM audit_outbox WHERE tenant=$1 ORDER BY id`, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]audit.Envelope{}
+	for rows.Next() {
+		var id string
+		var env audit.Envelope
+		if err := rows.Scan(&id, &env); err != nil {
+			t.Fatal(err)
+		}
+		if _, dup := byID[id]; dup || id != env.EventID {
+			t.Fatalf("outbox row %s duplicated or mismatched (%s)", id, env.EventID)
+		}
+		byID[id] = env
+	}
+	if len(byID) != len(evs) {
+		t.Fatalf("outbox has %d rows for %d events", len(byID), len(evs))
+	}
+	for _, e := range evs {
+		if env := byID[audit.EventID(tenant, e.Seq)]; env.Hash != e.Hash || env.Event.Allowed != e.Allowed {
+			t.Fatalf("seq %d: outbox %+v vs audit hash %s", e.Seq, env, e.Hash)
+		}
+	}
+	insts[0].pool.Exec(ctx, `DELETE FROM audit_outbox WHERE tenant=$1`, tenant)
+}

@@ -36,7 +36,7 @@ type config struct {
 	grpcAddr, httpAddr         string
 	pgDSN                      string
 	issuer, audience, jwksURL  string
-	devIssuer, pprof           bool
+	devIssuer, pprof, outbox   bool
 	devRotate                  time.Duration
 	tlsCert, tlsKey, clientCA  string
 	rate                       float64
@@ -51,6 +51,7 @@ func main() {
 	flag.StringVar(&c.grpcAddr, "grpc", ":9090", "gRPC listen address")
 	flag.StringVar(&c.httpAddr, "http", ":8080", "HTTP listen address (JSON API, /metrics, /healthz, /readyz)")
 	flag.StringVar(&c.pgDSN, "pg-dsn", os.Getenv("PG_DSN"), "Postgres DSN; empty = in-memory store")
+	flag.BoolVar(&c.outbox, "outbox", false, "with -pg-dsn: write each audit event to audit_outbox in the same statement, for gkrelay")
 	flag.StringVar(&c.issuer, "issuer", "", "expected JWT iss")
 	flag.StringVar(&c.audience, "audience", "gatekeeper", "expected JWT aud")
 	flag.StringVar(&c.jwksURL, "jwks-url", "", "JWKS endpoint of the issuer")
@@ -78,7 +79,11 @@ func run(c config, log *slog.Logger) error {
 
 	var st store.Store = store.NewMemory()
 	if c.pgDSN != "" {
-		pg, err := store.NewPostgres(ctx, c.pgDSN)
+		var opts []store.Option
+		if c.outbox {
+			opts = append(opts, store.WithOutbox())
+		}
+		pg, err := store.NewPostgres(ctx, c.pgDSN, opts...)
 		if err != nil {
 			return fmt.Errorf("postgres: %w", err)
 		}
@@ -165,7 +170,7 @@ func run(c config, log *slog.Logger) error {
 	go func() { errc <- gs.Serve(glis) }()
 	go func() { errc <- hs.Serve(hlis) }()
 	log.Info("listening", "grpc", glis.Addr().String(), "http", hlis.Addr().String(), "mtls", c.clientCA != "",
-		"store", map[bool]string{true: "postgres", false: "memory"}[c.pgDSN != ""], "rate", c.rate)
+		"store", map[bool]string{true: "postgres", false: "memory"}[c.pgDSN != ""], "outbox", c.outbox, "rate", c.rate)
 	if c.started != nil {
 		c.started <- [2]string{glis.Addr().String(), hlis.Addr().String()}
 	}

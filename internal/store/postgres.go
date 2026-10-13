@@ -20,7 +20,8 @@ import (
 var schema string
 
 type Postgres struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	outbox bool
 
 	// Chain heads this process last wrote or read, plus a per-tenant mutex so
 	// goroutines in one process never race each other to the same seq.
@@ -34,8 +35,15 @@ type head struct {
 	hash string
 }
 
+// Option configures NewPostgres.
+type Option func(*Postgres)
+
+// WithOutbox writes every audit event to audit_outbox in the same statement
+// (hence the same transaction) as the audit row.
+func WithOutbox() Option { return func(p *Postgres) { p.outbox = true } }
+
 // NewPostgres connects and applies schema.sql (idempotent).
-func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
+func NewPostgres(ctx context.Context, dsn string, opts ...Option) (*Postgres, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
@@ -44,7 +52,11 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 		pool.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	return &Postgres{pool: pool, heads: map[string]head{}, locks: map[string]*sync.Mutex{}}, nil
+	p := &Postgres{pool: pool, heads: map[string]head{}, locks: map[string]*sync.Mutex{}}
+	for _, o := range opts {
+		o(p)
+	}
+	return p, nil
 }
 
 func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
@@ -230,7 +242,9 @@ const insertAudit = `INSERT INTO audit_events
 		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15 `
 
 // insert links ev after h and writes it, returning rows inserted (0 when
-// tryLock is set and the tenant's advisory lock is held elsewhere).
+// tryLock is set and the tenant's advisory lock is held elsewhere). With the
+// outbox on, the outbox row is inserted by the same statement from the audit
+// row's RETURNING, so it exists iff the audit row does; still one round trip.
 func (p *Postgres) insert(ctx context.Context, q querier, ev *audit.Event, h head, tryLock bool) (int64, error) {
 	link(ev, h.seq, h.hash)
 	subj, _ := json.Marshal(ev.Subject)
@@ -241,6 +255,16 @@ func (p *Postgres) insert(ctx context.Context, q querier, ev *audit.Event, h hea
 	}
 	sql, args := insertAudit+guard, []any{ev.Tenant, ev.Seq, ev.TS, ev.Caller, subj, ev.Action, res, ev.PolicyVersion,
 		ev.Allowed, ev.Reason, ev.ShadowVersion, ev.ShadowAllowed, ev.ShadowDiverge, ev.PrevHash, ev.Hash}
+	if p.outbox {
+		id := audit.EventID(ev.Tenant, ev.Seq)
+		payload, err := json.Marshal(audit.Envelope{EventID: id, PrevHash: ev.PrevHash, Hash: ev.Hash, Event: *ev})
+		if err != nil {
+			return 0, err
+		}
+		sql = `WITH ev AS (` + sql + ` RETURNING tenant)
+		INSERT INTO audit_outbox (event_id, tenant, payload) SELECT $16, tenant, $17 FROM ev`
+		args = append(args, id, payload)
+	}
 	tag, err := q.Exec(ctx, sql, args...)
 	if err == nil && tag.RowsAffected() == 1 {
 		p.setHead(ev.Tenant, head{ev.Seq, ev.Hash})

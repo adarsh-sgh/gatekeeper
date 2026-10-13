@@ -95,3 +95,15 @@ func Verify(events []Event) (brokenAt int64) {
 	}
 	return 0
 }
+
+// EventID is an event's identity across relay retries and broker
+// redeliveries; consumers deduplicate on it.
+func EventID(tenant string, seq int64) string { return fmt.Sprintf("%s/%d", tenant, seq) }
+
+// Envelope is the outbox row and Kafka message payload.
+type Envelope struct {
+	EventID  string `json:"event_id"`
+	PrevHash string `json:"prev_hash"`
+	Hash     string `json:"hash"`
+	Event    Event  `json:"event"`
+}

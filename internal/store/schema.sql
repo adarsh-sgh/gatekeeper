@@ -51,3 +51,12 @@ CREATE TRIGGER audit_events_no_modify
     BEFORE UPDATE OR DELETE ON audit_events
     FOR EACH ROW EXECUTE FUNCTION audit_events_immutable();
 
+-- Transactional outbox: with -outbox each audit row and its outbox row are
+-- written by one statement, so both commit or neither does. The relay
+-- publishes rows in id order and deletes them after the broker acks.
+CREATE TABLE IF NOT EXISTS audit_outbox (
+    id       bigserial PRIMARY KEY,
+    event_id text  NOT NULL,
+    tenant   text  NOT NULL,
+    payload  jsonb NOT NULL
+);
