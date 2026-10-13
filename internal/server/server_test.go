@@ -463,8 +463,18 @@ func TestExtAuthz(t *testing.T) {
 		{"DELETE", "/docs/1", "u3", []string{"admin"}, 200},
 	}
 	for _, c := range cases {
-		if got := httpStatus(call(c.method, c.path, c.sub, c.roles...)); got != c.want {
+		r := call(c.method, c.path, c.sub, c.roles...)
+		if got := httpStatus(r); got != c.want {
 			t.Errorf("%s %s as %s%v: %d, want %d", c.method, c.path, c.sub, c.roles, got, c.want)
+		}
+		if ok := r.GetOkResponse(); ok != nil {
+			up := map[string]string{}
+			for _, h := range ok.Headers {
+				up[h.Header.Key] = h.Header.Value
+			}
+			if up["x-gatekeeper-subject"] != c.sub || up["x-gatekeeper-tenant"] != "acme" {
+				t.Errorf("%s %s: upstream headers %v", c.method, c.path, up)
+			}
 		}
 	}
 	evs, _ := e.grpc.ListAuditEvents(admin, &pb.ListAuditEventsRequest{})

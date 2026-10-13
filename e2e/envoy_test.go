@@ -48,7 +48,8 @@ func TestEnvoyExtAuthz(t *testing.T) {
 	}
 	audited := 0
 	for _, c := range cases {
-		r := do(t, c.method, envoy+c.path, c.token, "")
+		// A client-supplied identity header must be overwritten, never trusted.
+		r := do(t, c.method, envoy+c.path, c.token, "", "X-Gatekeeper-Subject", "spoofed")
 		if r.code != c.want {
 			t.Errorf("%s: %d, want %d (%s)", c.name, r.code, c.want, r.body)
 			continue
@@ -57,6 +58,9 @@ func TestEnvoyExtAuthz(t *testing.T) {
 		case 200:
 			if r.body != "upstream ok\n" || r.hdr.Get("X-Gatekeeper-Audit-Seq") == "" {
 				t.Errorf("%s: allowed response missing upstream body or audit seq: %v %q", c.name, r.hdr, r.body)
+			}
+			if sub := r.hdr.Get("X-Upstream-Saw-Subject"); sub == "spoofed" || sub == "" || r.hdr.Get("X-Upstream-Saw-Tenant") != "acme" {
+				t.Errorf("%s: upstream saw subject %q tenant %q", c.name, sub, r.hdr.Get("X-Upstream-Saw-Tenant"))
 			}
 		case 403:
 			if r.hdr.Get("X-Gatekeeper-Audit-Seq") == "" {
