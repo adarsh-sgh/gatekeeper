@@ -398,7 +398,9 @@ func TestTenantAdmin(t *testing.T) {
 	req, _ = http.NewRequest("GET", e.http.URL+"/v1/tenants", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, _ := http.DefaultClient.Do(req)
-	var list struct{ Tenants []struct{ Name, DisplayName string } }
+	var list struct {
+		Tenants []struct{ Name, DisplayName string }
+	}
 	json.NewDecoder(resp.Body).Decode(&list)
 	if len(list.Tenants) != 2 || list.Tenants[1].Name != "globex" || list.Tenants[1].DisplayName != "Globex" {
 		t.Fatalf("http list tenants: %+v", list)

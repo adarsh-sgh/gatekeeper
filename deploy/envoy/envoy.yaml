@@ -1,0 +1,48 @@
+# Envoy front proxy: every request is authorised by gatekeeper over the
+# ext_authz gRPC API before it reaches the route. The route is a
+# direct_response stand-in for an upstream app.
+static_resources:
+  listeners:
+    - name: ingress
+      address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                route_config:
+                  virtual_hosts:
+                    - name: app
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "upstream ok\n" } }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      grpc_service:
+                        envoy_grpc: { cluster_name: gatekeeper }
+                        timeout: 0.5s
+                      failure_mode_allow: false   # gatekeeper down or erroring => deny
+                      status_on_error: { code: ServiceUnavailable }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: gatekeeper
+      type: STRICT_DNS
+      connect_timeout: 0.25s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: { http2_protocol_options: {} }
+      load_assignment:
+        cluster_name: gatekeeper
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: gatekeeper, port_value: 9090 } } }
+admin:
+  address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }

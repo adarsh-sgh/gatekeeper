@@ -1,0 +1,11 @@
+# Envoy -> gatekeeper ext_authz demo; driven by `make e2e-envoy`.
+services:
+  gatekeeper:
+    build: ../..
+    command: ["-dev-issuer", "-http", ":8080", "-grpc", ":9090", "-drain", "0s"]
+    ports: ["${GK_HTTP_PORT:-18080}:8080"]
+  envoy:
+    image: envoyproxy/envoy:v1.36-latest
+    depends_on: [gatekeeper]
+    volumes: ["./envoy.yaml:/etc/envoy/envoy.yaml:ro"]
+    ports: ["${ENVOY_PORT:-10000}:10000"]
